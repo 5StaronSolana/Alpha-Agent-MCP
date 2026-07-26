@@ -4,9 +4,7 @@
 
 This repo implements a lightweight MCP server for the CLOB prediction market platform. Consuming agents must **never have to guess**.
 
-**ONLY AGENTS.md IS USED** for the agent contract, "never guess", mandatory startup, recipes, and all instructions. The project's README.md has been removed from agent usage and references per request. All links, "see README", and mandatory flows now point exclusively here (AGENTS.md). The GitHub blob link for the project README is no longer referenced or active for agents.
-
-The project README.md file itself has been stubbed with an explicit redirect at the top: any visitor (or old link) is instructed to use *only* the AGENTS.md GitHub URL. Relative references in source were updated from "see README.md". No other code, prompts, recipes, or docs reference the project's README for agent purposes. AGENTS.md is the sole "been used" file.
+**AGENTS.md is the source of truth for agent behavior**: the contract, "never guess" rules, mandatory startup sequence, and recipes for consuming agents all live here, not in README.md. README.md still exists as the human-facing project overview (install steps, tool inventory, safety/guardrails section) — it is not stubbed or redirected. Agents should read AGENTS.md for how to behave; humans setting up the server should start with README.md.
 
 ## Mandatory First Reads (do these in order)
 
@@ -45,7 +43,7 @@ All tool outputs are pre-formatted, human-readable, and ready for LLM interpreta
 - Pagination (enforced on all `list_*`): default `limit = 10` (max 100). Use `limit` (or legacy `pageSize`) + `offset` (default 0). Responses include `items`, `total` (when available from SDK paginator), `limit`, `offset`, `nextCursor`. Tool descriptions state the limits.
 - Strategy store: lightweight internal/host (Hermes) supporting bag under composite keys for rules/filters (not a public MCP tool surface in the pure model). Host owns brain + heartbeat.md / OpenClaw.
 - All trading explicit only (concrete `price`/`size`/`side` from `get_farmability`, `suggest_qualified_size`, or host strategy rules). Never trade-by-intent.
-- Guardrails (local, via strategy key "guardrails:global" if used by host): pre-execution checks on place_* (size, deviation, allowlist, readOnly). Blocks return explicit {blocked, reason, agentDirective}.
+- Guardrails (local, via strategy key "guardrails:global"): pre-execution checks on place_*. **Default is readOnly (all placement blocked) until the owner explicitly sets `guardrails:global`** — this is a safety default for a server that ships to third-party operators/agents with a funded wallet, not an opt-in nicety. Once configured, checks cover size, deviation, allowlist, readOnly, open-order count. Blocks return explicit {blocked, reason, agentDirective}. See README.md "Safety" section and `src/mcp/guardrails.ts`.
 - Outputs: always pre-formatted human-readable **Label:** cards (dates, links, emojis, Guidance/Directive where helpful). Low token, no raw JSON parsing needed by agent.
 
 ## When making changes

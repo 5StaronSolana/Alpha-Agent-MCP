@@ -67,6 +67,32 @@ Health check: `npm run doctor`
 
 ---
 
+## Safety — orders are blocked until you opt in
+
+**By default, no order will be placed.** Until you explicitly configure guardrails, every `place_limit_order` / `place_market_order` / `place_optimized_reward_order` call is rejected with a `readOnly` block. This is deliberate: this server is designed to be pointed at a live, funded wallet and connected to an autonomous agent (OpenClaw, Hermes, or any MCP host), so it should never place a real order before its owner has decided what that agent is allowed to do.
+
+To allow trading, call `update_strategy`:
+
+```json
+update_strategy({ "tokenId": "guardrails:global", "readOnly": false })
+```
+
+You can (and should) cap what the agent can do at the same time:
+
+```json
+update_strategy({
+  "tokenId": "guardrails:global",
+  "readOnly": false,
+  "maxOrderSizeUsd": 50,
+  "maxPriceDeviationFromMid": 0.05,
+  "maxOpenOrdersTotal": 10
+})
+```
+
+Fields: `readOnly`, `maxOrderSizeUsd` (hard cap on notional per order), `maxPriceDeviationFromMid` (reject orders far from mid), `allowedTokenIds` (allowlist), `maxOpenOrdersTotal`. Unset fields impose no restriction on that dimension once you've configured the key at all. See `src/mcp/guardrails.ts`.
+
+---
+
 ## How agents use it
 
 Standard MCP protocol — nothing proprietary:

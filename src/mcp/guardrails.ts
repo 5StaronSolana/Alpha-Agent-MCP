@@ -6,8 +6,17 @@
  * no keys, no gateway. Enforced inline inside the MCP process before any SDK mutation.
  *
  * Configuration: Use the existing strategy bag (update_strategy / get_strategies)
- * under the special composite key "guardrails:global". Unset/empty fields = no restriction
- * (default-open behavior preserved for all existing users and flows).
+ * under the special composite key "guardrails:global".
+ *
+ * Default posture: if "guardrails:global" has never been set at all, the server
+ * is treated as readOnly (no orders may be placed) until the wallet owner
+ * explicitly configures it. This matters because this MCP ships to strangers
+ * (npm install, arbitrary agent hosts) with no setup wizard — a freshly
+ * cloned/installed server, pointed at a funded key, must not let a connected
+ * agent start placing real orders before anyone has opted in. Once
+ * "guardrails:global" has been set (even to `{}`), every individual field
+ * goes back to "unset = no restriction on that field" — an owner who has
+ * explicitly configured guardrails is trusted to mean what they configured.
  *
  * Persistence: Values live in strategyStore (in-memory) and are saved via
  * persistStrategiesToDisk() → logs/agent-strategy.json. Survives MCP restarts
@@ -38,15 +47,27 @@ export type Guardrails = {
 
 /**
  * Read the guardrails config for the special key "guardrails:global".
- * Returns {} (no restrictions) when unset or invalid. Never throws.
+ *
+ * - Never configured at all (store has no "guardrails:global" key): returns
+ *   { readOnly: true } — safe-by-default until the owner opts in.
+ * - Configured (even as {}): per-field unset = no restriction on that field,
+ *   readOnly defaults to false since the owner has now explicitly engaged
+ *   with this config.
+ * - Invalid value (wrong type): treated the same as "never configured" —
+ *   fail closed rather than silently ignoring a malformed config.
+ *
+ * Never throws.
  */
 export function getGuardrails(store: Map<string, unknown>): Guardrails {
+  if (!store.has('guardrails:global')) {
+    return { readOnly: true };
+  }
   const raw = store.get('guardrails:global');
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     const g = raw as Partial<Guardrails>;
     // Basic sanitization / defaults (numbers stay as-is; we validate at check time)
     return {
-      readOnly: typeof g.readOnly === 'boolean' ? g.readOnly : undefined,
+      readOnly: typeof g.readOnly === 'boolean' ? g.readOnly : false,
       maxOrderSizeUsd: typeof g.maxOrderSizeUsd === 'number' && g.maxOrderSizeUsd > 0 ? g.maxOrderSizeUsd : undefined,
       maxPriceDeviationFromMid:
         typeof g.maxPriceDeviationFromMid === 'number' && g.maxPriceDeviationFromMid > 0 ? g.maxPriceDeviationFromMid : undefined,
@@ -54,7 +75,7 @@ export function getGuardrails(store: Map<string, unknown>): Guardrails {
       maxOpenOrdersTotal: typeof g.maxOpenOrdersTotal === 'number' && g.maxOpenOrdersTotal >= 0 ? g.maxOpenOrdersTotal : undefined,
     };
   }
-  return {};
+  return { readOnly: true };
 }
 
 /**
