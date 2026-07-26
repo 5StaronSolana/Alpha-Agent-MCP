@@ -18,7 +18,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { getGuardrails, checkOrderAgainstGuardrails } from './mcp/guardrails.js';
+import { getGuardrails, checkOrderAgainstGuardrails, checkStateChangingActionAgainstGuardrails, checkTransferAgainstGuardrails } from './mcp/guardrails.js';
 import { deployDepositWallet, isWalletDeployed } from '@polymarket/client/actions';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -118,6 +118,51 @@ function guardBlockOrThrough(
         blocked: true,
         reason: result.reason,
         agentDirective: 'This order was blocked by local guardrails, not by Polymarket. Relay this to your owner — they need to call update_strategy({ tokenId: "guardrails:global", ... }) to adjust guardrails before this can succeed.',
+      }, null, 2),
+    }],
+  };
+}
+
+/**
+ * Enforcement point for on-chain state-changing actions that aren't order
+ * placement (split/merge/redeem positions, enable_auto_redeem, approvals,
+ * update_balance_allowance). Same readOnly-by-default posture as orders —
+ * see guardBlockOrThrough / mcp/guardrails.ts.
+ */
+function stateGuardOrThrough(): { isError: true; content: [{ type: 'text'; text: string }] } | null {
+  const guardrails = getGuardrails(strategyStore);
+  const result = checkStateChangingActionAgainstGuardrails(guardrails);
+  if (result.ok) return null;
+  return {
+    isError: true,
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify({
+        blocked: true,
+        reason: result.reason,
+        agentDirective: 'This action was blocked by local guardrails, not by Polymarket. Relay this to your owner — they need to call update_strategy({ tokenId: "guardrails:global", readOnly: false, ... }) to allow it.',
+      }, null, 2),
+    }],
+  };
+}
+
+/**
+ * Enforcement point for transfer_erc20 specifically — readOnly plus an
+ * optional recipient allowlist, since a raw transfer has no exchange
+ * counterparty or price bound at all.
+ */
+function transferGuardOrThrough(recipientAddress: string): { isError: true; content: [{ type: 'text'; text: string }] } | null {
+  const guardrails = getGuardrails(strategyStore);
+  const result = checkTransferAgainstGuardrails(recipientAddress, guardrails);
+  if (result.ok) return null;
+  return {
+    isError: true,
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify({
+        blocked: true,
+        reason: result.reason,
+        agentDirective: 'This transfer was blocked by local guardrails, not by Polymarket. Relay this to your owner — they need to call update_strategy({ tokenId: "guardrails:global", readOnly: false, allowedTransferAddresses: [...] }) to allow it.',
       }, null, 2),
     }],
   };
@@ -2169,8 +2214,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } catch (e: any) { return { content: [{ type: 'text' as const, text: `Error creating secure client: ${String(e?.message || e)}. Provide credentials.` }] }; }
     }
     case 'setup_trading_approvals': {
+      const guardStateBlock9 = stateGuardOrThrough();
+      if (guardStateBlock9) return guardStateBlock9;
       const s = await getSec();
-      const res = await s.setupTradingApprovals?.(args) ?? await (await import('@polymarket/client/actions')).setupTradingApprovals(args);
+      const res = await s.setupTradingApprovals?.(args) ?? await (await import('@polymarket/client/actions')).setupTradingApprovals(s);
       const info = { 'Status': 'Trading approvals ensured (idempotent for USDC/CTF)', 'Result': res || 'Success' };
       return { content: [{ type: 'text' as const, text: F.toHumanReadable(info, 'Setup Trading Approvals') }] };
     }
@@ -2208,10 +2255,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'submit_rfq_quote': { const s=await getSec(); const r = await (s as any).submitRfqQuote?.(args) ?? { accepted: false, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Quote Submitted': r }, 'Submit RFQ Quote') }] }; }
     case 'get_rfq_quotes': { const s=await getSec(); const r = await (s as any).getRfqQuotes?.(args) ?? []; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Quotes': r }, 'Get RFQ Quotes') }] }; }
     case 'confirm_rfq_trade': { const s=await getSec(); const r = await (s as any).confirmRfqTrade?.(args) ?? { executed: false, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'RFQ Trade Confirmation': r }, 'Confirm RFQ Trade') }] }; }
-    case 'split_position': { const s = await getSec(); const r = await s.splitPosition(args as any); return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Split Result / Tx': r }, 'Split Position') }] }; }
-    case 'merge_positions': { const s = await getSec(); const r = await s.mergePositions(args as any); return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Merge Result / Tx': r }, 'Merge Positions') }] }; }
-    case 'redeem_positions': { const s = await getSec(); const r = await s.redeemPositions(args as any); return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Redeem Result / Tx': r }, 'Redeem Positions') }] }; }
-    case 'enable_auto_redeem': { const s=await getSec(); const r= await (s as any).enableAutoRedeem?.(args) ?? true; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Auto Redeem Enabled': r }, 'Enable Auto Redeem') }] }; }
+    case 'split_position': { const guardStateBlock1 = stateGuardOrThrough(); if (guardStateBlock1) return guardStateBlock1; const s = await getSec(); const r = await s.splitPosition(args as any); return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Split Result / Tx': r }, 'Split Position') }] }; }
+    case 'merge_positions': { const guardStateBlock2 = stateGuardOrThrough(); if (guardStateBlock2) return guardStateBlock2; const s = await getSec(); const r = await s.mergePositions(args as any); return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Merge Result / Tx': r }, 'Merge Positions') }] }; }
+    case 'redeem_positions': { const guardStateBlock3 = stateGuardOrThrough(); if (guardStateBlock3) return guardStateBlock3; const s = await getSec(); const r = await s.redeemPositions(args as any); return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Redeem Result / Tx': r }, 'Redeem Positions') }] }; }
+    case 'enable_auto_redeem': { const guardStateBlock4 = stateGuardOrThrough(); if (guardStateBlock4) return guardStateBlock4; const s=await getSec(); const r= await (s as any).enableAutoRedeem?.(args) ?? true; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Auto Redeem Enabled': r }, 'Enable Auto Redeem') }] }; }
     case 'prepare_split_position': { const s=await getSec(); const r = await (s as any).prepareSplitPosition?.(args) ?? { prepared: true, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Prepared Split Tx': r }, 'Prepare Split Position') }] }; }
     case 'prepare_merge_positions': { const s=await getSec(); const r = await (s as any).prepareMergePositions?.(args) ?? { prepared: true, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Prepared Merge Tx': r }, 'Prepare Merge Positions') }] }; }
     case 'prepare_redeem_positions': { const s=await getSec(); const r = await (s as any).prepareRedeemPositions?.(args) ?? { prepared: true, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Prepared Redeem Tx': r }, 'Prepare Redeem Positions') }] }; }
@@ -2226,7 +2273,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'fetch_transaction': return callWithFormat(() => pub.fetchTransaction?.(args as any) ?? (args as any), (x:any)=>x, name);
     case 'download_accounting_snapshot': { const s=await getSec(); const r=await (s as any).downloadAccountingSnapshot?.(args) ?? { downloaded: true }; return {content:[{type:'text',text:JSON.stringify({success:true,result:r})}]}; }
     case 'prepare_gasless_transaction': { const s=await getSec(); const r = await (s as any).prepareGaslessTransaction?.(args) ?? { prepared: true, ...args }; return {content:[{type:'text',text:JSON.stringify({success:true,prepared:r})}]}; }
-    case 'send_transaction': { const s=await getSec(); const r = await (s as any).sendTransaction?.(args) ?? { sent: true, ...args }; return {content:[{type:'text',text:JSON.stringify({success:true,result:r})}]}; }
+    case 'send_transaction': { const guardStateBlock8 = stateGuardOrThrough(); if (guardStateBlock8) return guardStateBlock8; const s=await getSec(); const r = await (s as any).sendTransaction?.(args) ?? { sent: true, ...args }; return {content:[{type:'text',text:JSON.stringify({success:true,result:r})}]}; }
     case 'watch_order_until_filled': {
       // Custom polling + resource aware (simplified; real impl uses resources in prod)
       const orderId = (args as any).orderId; const timeout = Number((args as any).timeoutMs || 120000);
@@ -3842,51 +3889,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     case 'list_account_trades':
       return callPaginatedWithFormat((await getSec()).listAccountTrades(args), F.formatTrade, name);
-    case 'setup_trading_approvals': {
-      try {
-        const h = await (await getSec()).setupTradingApprovals();
-        const card = await F.formatTransactionHandle(h);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(card, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2) }] };
-      } catch (error: any) {
-        return { isError: true, content: [{ type: 'text' as const, text: `Error in setup_trading_approvals: ${error?.message || String(error)}` }] };
-      }
-    }
-    case 'enable_auto_redeem': {
-      try {
-        const h = await (await getSec()).setupTradingApprovals();
-        const card = await F.formatTransactionHandle(h);
-        return { content: [{ type: 'text' as const, text: JSON.stringify({ 'Auto-Redeem Enabled': true, ...card }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2) }] };
-      } catch (error: any) {
-        return { isError: true, content: [{ type: 'text' as const, text: `Error in enable_auto_redeem: ${error?.message || String(error)}` }] };
-      }
-    }
-    case 'split_position': {
-      try {
-        const h = await (await getSec()).splitPosition(args);
-        const card = await F.formatTransactionHandle(h);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(card, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2) }] };
-      } catch (error: any) {
-        return { isError: true, content: [{ type: 'text' as const, text: `Error in split_position: ${error?.message || String(error)}` }] };
-      }
-    }
-    case 'merge_positions': {
-      try {
-        const h = await (await getSec()).mergePositions(args);
-        const card = await F.formatTransactionHandle(h);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(card, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2) }] };
-      } catch (error: any) {
-        return { isError: true, content: [{ type: 'text' as const, text: `Error in merge_positions: ${error?.message || String(error)}` }] };
-      }
-    }
-    case 'redeem_positions': {
-      try {
-        const h = await (await getSec()).redeemPositions(args);
-        const card = await F.formatTransactionHandle(h);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(card, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2) }] };
-      } catch (error: any) {
-        return { isError: true, content: [{ type: 'text' as const, text: `Error in redeem_positions: ${error?.message || String(error)}` }] };
-      }
-    }
 
     // === Leaderboards + Public Profiles ===
     case 'list_builder_leaderboard':
@@ -4087,24 +4089,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // send_heartbeat removed (internal; not a public SDK tool exposed to agents)
 
     // === Direct On-Chain (secure) ===
-    case 'approve_erc20':
+    case 'approve_erc20': {
+      const guardStateBlock5 = stateGuardOrThrough();
+      if (guardStateBlock5) return guardStateBlock5;
       return callWithFormat(async () => (await getSec()).approveErc20(args), F.formatTransactionHandle, name);
-    case 'approve_erc1155_for_all':
+    }
+    case 'approve_erc1155_for_all': {
+      const guardStateBlock6 = stateGuardOrThrough();
+      if (guardStateBlock6) return guardStateBlock6;
       return callWithFormat(async () => (await getSec()).approveErc1155ForAll(args), F.formatTransactionHandle, name);
-    case 'transfer_erc20':
+    }
+    case 'transfer_erc20': {
+      const guardTransferBlock = transferGuardOrThrough(String((args as any)?.recipientAddress ?? ''));
+      if (guardTransferBlock) return guardTransferBlock;
       return callWithFormat(async () => (await getSec()).transferErc20(args), F.formatTransactionHandle, name);
+    }
     case 'resolve_condition_by_token':
       return callWithFormat(async () => (await getSec()).resolveConditionByToken(args), F.formatTransactionHandle, name);
 
     // === Account / Wallet Additional (secure) ===
-    case 'update_balance_allowance':
+    case 'update_balance_allowance': {
+      const guardStateBlock7 = stateGuardOrThrough();
+      if (guardStateBlock7) return guardStateBlock7;
       return callWithFormat(async () => {
         const sec = await getSec();
         return updateBalanceAllowance(sec, args || {});
       }, F.formatGeneric, name);
+    }
     case 'deploy_deposit_wallet':
-      // Explicit deploy for deposit wallet (still supported; auto-deploy now happens in create for DEPOSIT_WALLET type per latest SDK).
-      return callWithFormat(async () => (await getSec()).deployDepositWallet(), F.formatTransactionHandle, name);
+      // SDK note: deployDepositWallet is a standalone function (@polymarket/client/actions),
+      // not a client method, as of 0.1.0+. Auto-deploy now happens in createSecureClient for
+      // DEPOSIT_WALLET type, but this stays available as an explicit/idempotent fallback.
+      return callWithFormat(async () => {
+        const handle = await deployDepositWallet(await getSec());
+        await handle.wait();
+        return handle;
+      }, F.formatTransactionHandle, name);
     case 'download_accounting_snapshot':
       return callWithFormat(async () => (await getSec()).downloadAccountingSnapshot(args), F.formatAccountingSnapshot, name);
     case 'fetch_transaction':
@@ -4180,19 +4200,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ signature: sig }, null, 2) }] };
       } catch (error: any) {
         return { isError: true, content: [{ type: 'text' as const, text: `sign_typed_data error: ${error?.message || String(error)}` }] };
-      }
-    }
-    case 'send_transaction': {
-      try {
-        const sec = await getSec();
-        const signer = (sec as any).signer;
-        if (!signer || typeof signer.sendTransaction !== 'function') {
-          throw new Error('No signer available on secure client');
-        }
-        const handle = await signer.sendTransaction(args.request);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(handle, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2) }] };
-      } catch (error: any) {
-        return { isError: true, content: [{ type: 'text' as const, text: `send_transaction error: ${error?.message || String(error)}` }] };
       }
     }
     case 'end_authentication': {

@@ -22,8 +22,15 @@
  * persistStrategiesToDisk() → logs/agent-strategy.json. Survives MCP restarts
  * regardless of which host reconnects.
  *
- * Enforcement points: place_limit_order, place_maker_reward_order, place_optimized_reward_order.
- * Checked after arg normalization / suggestion, before any createLimitOrder / postOrder / place* SDK call.
+ * Enforcement points:
+ * - Orders (checkOrderAgainstGuardrails): place_limit_order, place_market_order,
+ *   place_maker_reward_order, place_optimized_reward_order. Checked after arg
+ *   normalization / suggestion, before any placeOrder / createLimitOrder / postOrder SDK call.
+ * - On-chain state-changing actions (checkStateChangingActionAgainstGuardrails):
+ *   split_position, merge_positions, redeem_positions, enable_auto_redeem,
+ *   approve_erc20, approve_erc1155_for_all, update_balance_allowance.
+ * - Transfers (checkTransferAgainstGuardrails, adds allowedTransferAddresses):
+ *   transfer_erc20.
  *
  * Observability: Current config + block attempts surface in get_mcp_usage (as a dedicated block)
  * and in mcp_doctor (synthetic checks run on every report for live verification).
@@ -43,6 +50,13 @@ export type Guardrails = {
   allowedTokenIds?: string[];
   /** Max concurrent open orders (checked against list_open_orders count at check time). */
   maxOpenOrdersTotal?: number;
+  /**
+   * If non-empty, transfer_erc20 may only send to these addresses (lowercase
+   * comparison). Sending to an arbitrary address is a materially different
+   * risk from trading (no exchange counterparty, no price bound at all), so
+   * this exists even though nothing else needs an address allowlist.
+   */
+  allowedTransferAddresses?: string[];
 };
 
 /**
@@ -73,9 +87,63 @@ export function getGuardrails(store: Map<string, unknown>): Guardrails {
         typeof g.maxPriceDeviationFromMid === 'number' && g.maxPriceDeviationFromMid > 0 ? g.maxPriceDeviationFromMid : undefined,
       allowedTokenIds: Array.isArray(g.allowedTokenIds) ? g.allowedTokenIds.filter((x): x is string => typeof x === 'string') : undefined,
       maxOpenOrdersTotal: typeof g.maxOpenOrdersTotal === 'number' && g.maxOpenOrdersTotal >= 0 ? g.maxOpenOrdersTotal : undefined,
+      allowedTransferAddresses: Array.isArray(g.allowedTransferAddresses)
+        ? g.allowedTransferAddresses.filter((x): x is string => typeof x === 'string')
+        : undefined,
     };
   }
   return { readOnly: true };
+}
+
+/**
+ * Gate for on-chain state-changing actions that aren't order placement:
+ * split_position, merge_positions, redeem_positions, enable_auto_redeem,
+ * approve_erc20, approve_erc1155_for_all, update_balance_allowance. These
+ * move or approve access to the owner's own funds, so they share the same
+ * readOnly gate as orders — a freshly configured server must not let any of
+ * them through before the owner opts in. Notional/deviation/allowlist
+ * concepts from checkOrderAgainstGuardrails don't apply generically here
+ * (there's no consistent price/size shape), so this only checks readOnly.
+ */
+export function checkStateChangingActionAgainstGuardrails(
+  guardrails: Guardrails
+): { ok: true } | { ok: false; reason: string } {
+  if (guardrails.readOnly) {
+    return {
+      ok: false,
+      reason:
+        'readOnly guardrail is set — no on-chain actions may be placed. ' +
+        'update_strategy({ tokenId: "guardrails:global", readOnly: false }) to allow trading.',
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Gate specifically for transfer_erc20: readOnly, plus an optional recipient
+ * allowlist. A raw transfer has no exchange counterparty and no price bound
+ * — it can send funds to any address for any amount — so it gets its own,
+ * stricter check rather than reusing the generic state-changing gate alone.
+ */
+export function checkTransferAgainstGuardrails(
+  recipientAddress: string,
+  guardrails: Guardrails
+): { ok: true } | { ok: false; reason: string } {
+  const base = checkStateChangingActionAgainstGuardrails(guardrails);
+  if (!base.ok) return base;
+
+  if (guardrails.allowedTransferAddresses?.length) {
+    const allowed = guardrails.allowedTransferAddresses.some(
+      (a) => a.toLowerCase() === recipientAddress.toLowerCase()
+    );
+    if (!allowed) {
+      return {
+        ok: false,
+        reason: `recipientAddress ${recipientAddress} not in allowedTransferAddresses allowlist.`,
+      };
+    }
+  }
+  return { ok: true };
 }
 
 /**
