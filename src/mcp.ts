@@ -19,6 +19,7 @@ import {
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { getGuardrails, checkOrderAgainstGuardrails } from './mcp/guardrails.js';
+import { deployDepositWallet, isWalletDeployed } from '@polymarket/client/actions';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { getPublicClient, getSecureClient } from './lib.js';
@@ -893,12 +894,12 @@ const publicTools = [
   },
   {
     name: 'is_gasless_ready',
-    description: '[Gasless] Direct SDK isGaslessReady on secure client.',
+    description: '[Gasless] Direct SDK isWalletDeployed(client).',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'setup_gasless_wallet',
-    description: '[Gasless] Direct SDK setupGaslessWallet.',
+    description: '[Gasless] Direct SDK deployDepositWallet(client).',
     inputSchema: { type: 'object', properties: {} }
   },
   {
@@ -1656,12 +1657,12 @@ const secureTools = [
   },
   {
     name: 'is_gasless_ready',
-    description: '[Gasless] SDK isGaslessReady() - check if the secure client / wallet supports gasless trading.',
+    description: '[Gasless] SDK isWalletDeployed(client) - check if the deposit wallet is deployed/gasless-ready.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'setup_gasless_wallet',
-    description: '[Gasless] SDK setupGaslessWallet() - setup for gasless (idempotent in recent SDK).',
+    description: '[Gasless] SDK deployDepositWallet(client) - deploy the gasless deposit wallet (idempotent no-op if already deployed).',
     inputSchema: { type: 'object', properties: {} }
   },
   {
@@ -3148,15 +3149,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'is_gasless_ready': {
       try {
         const sec = await getSecureClient();
-        const ready = await sec.isGaslessReady().catch(() => false);
-        return { content: [{ type: 'text', text: JSON.stringify({ success: true, isGaslessReady: ready, source: 'Direct SDK isGaslessReady()' }) }] };
+        const ready = await isWalletDeployed(sec).catch(() => false);
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, isGaslessReady: ready, source: 'Direct SDK isWalletDeployed()' }) }] };
       } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
     }
     case 'setup_gasless_wallet': {
       try {
         const sec = await getSecureClient();
-        const updated = await sec.setupGaslessWallet().catch(() => sec);
-        return { content: [{ type: 'text', text: JSON.stringify({ success: true, note: 'setupGaslessWallet called (idempotent per recent SDK).', source: 'Direct SDK' }) }] };
+        const handle = await deployDepositWallet(sec).catch(() => null);
+        if (handle) await handle.wait().catch(() => {});
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, note: 'deployDepositWallet called (idempotent — no-op if already deployed).', source: 'Direct SDK' }) }] };
       } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
     }
     case 'list_current_rewards': {
@@ -3302,8 +3304,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'subscribe_user': { await resourceManager.ensureUserSubscription('polymarket://user/orders').catch(()=>{}); return {content:[{type:'text',text:JSON.stringify({success:true,resources:['polymarket://user/*']})}]}; }
     case 'subscribe_prices_crypto': { return {content:[{type:'text',text:JSON.stringify({success:true,topic:'prices.crypto'})}]}; }
     case 'subscribe_wallet_activity': { const a=String(args.address||'').trim(); if(!a.toLowerCase().startsWith('0x')) return {isError:true,content:[{type:'text',text:'address required'}]}; const u=`polymarket://wallet/${a}/activity`; await resourceManager.subscribe(u).catch(()=>{}); return {content:[{type:'text',text:JSON.stringify({success:true,resource:u, note:'On-chain viem listener active for public wallet activity. Use read_resource on the uri. No guessing — standard MCP resource flow.', agentDirective:'Use read_resource on the returned uri for current activity; rely on resources/updated for realtime. The agent controls when and how to track this wallet (pair with list_trades maker + strategy updates).'})}]}; }
-    case 'is_gasless_ready': { try{const s=await getSecureClient();const r=await s.isGaslessReady().catch(()=>false);return{content:[{type:'text',text:JSON.stringify({success:true,isGaslessReady:r})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'setup_gasless_wallet': { try{const s=await getSecureClient();await s.setupGaslessWallet().catch(()=>{});return{content:[{type:'text',text:JSON.stringify({success:true})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
     case 'list_current_rewards': { try{const p=getPublicClient();const lim=sanitizePageSize(args);const off=Number((args as any)?.offset??0)||0;const c=await callWithRateLimitProtection(()=>p.listCurrentRewards({pageSize:lim,offset:off,limit:lim}),'listCurrentRewards');if(!c.ok)throw new Error(c.message);const pg=await (c.data.firstPage?c.data.firstPage():c.data);const items=pg?.items||[];return{content:[{type:'text',text:JSON.stringify({items,total:(pg as any)?.total,limit:lim,offset:off,nextCursor:(pg as any)?.nextCursor,source:'Direct SDK listCurrentRewards'},null,2)}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:(e as any).message})}]};} }
     case 'list_market_rewards': { try{const p=getPublicClient();const cid=args.conditionId;if(!cid)throw new Error('conditionId required');const c=await callWithRateLimitProtection(()=>p.listMarketRewards({conditionId:cid}),'listMarketRewards');if(!c.ok)throw new Error(c.message);return{content:[{type:'text',text:JSON.stringify({success:true,rewards:c.data||{},source:'Direct SDK listMarketRewards'})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
     case 'order_scoring': { return {content:[{type:'text',text:JSON.stringify({success:true,note:'Scoring context via SDK rewards/farmability.'})}]}; }
@@ -4044,8 +4044,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return callWithFormat(async () => (await getSec()).dropNotifications(args), F.formatGeneric, name);
     case 'fetch_closed_only_mode':
       return callWithFormat(async () => (await getSec()).fetchClosedOnlyMode(), F.formatGeneric, name);
-    case 'is_gasless_ready':
-      return callWithFormat(async () => (await getSec()).isGaslessReady(), F.formatGeneric, name);
     case 'fetch_deposit_wallet':
       return callWithFormat(async () => (await getSec()).getDepositWallet?.(args) || /* resolve via actions or client */ { note: 'deposit wallet derivation' }, F.formatGeneric, name);
     case 'get_profile':

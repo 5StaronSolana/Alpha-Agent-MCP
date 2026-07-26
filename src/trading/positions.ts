@@ -12,6 +12,7 @@
  * This module wraps the on-chain position management flows using only SDK methods.
  */
 import type { TransactionHandle, TransactionOutcome } from '@polymarket/client';
+import { deployDepositWallet, isWalletDeployed } from '@polymarket/client/actions';
 import { getSecureClient } from '../config/client.js';
 import { withErrorHandling } from '../utils/errors.js';
 import { logger, logTrade } from '../utils/logger.js';
@@ -141,24 +142,24 @@ export async function transferCollateral(params: {
  * One-time (or idempotent) setup for gasless trading + CTF approvals.
  * Already exposed via config/client.ts ensureTradingSetup, but provided here for convenience.
  *
- * Updated for latest SDK: approvals idempotent; gasless/deposit defaults in createSecureClient;
- * setupGaslessWallet deprecated no-op.
+ * SDK note (@polymarket/client 0.1.0+): gasless deployment is the standalone
+ * deployDepositWallet(client) -> TransactionHandle, and readiness is checked
+ * via isWalletDeployed(client) -> boolean — neither is a method on the client
+ * anymore. setupTradingApprovals() now resolves Promise<void> directly
+ * (idempotent, already waited internally).
  */
 export async function setupTradingEnvironment(): Promise<void> {
   const client = await secure();
   logger.info('Running full trading environment setup (gasless + CTF approvals)...');
 
-  const isGasless = await client.isGaslessReady().catch(() => false);
+  const isGasless = await isWalletDeployed(client).catch(() => false);
   if (!isGasless) {
-    // Note: per latest SDK, gasless setup for deposit wallets is automatic inside createSecureClient.
-    // setupGaslessWallet is @deprecated no-op. Call kept for compat.
-    await client.setupGaslessWallet().catch(() => {});
-    logger.info('Gasless setup invoked (may be no-op)');
+    const handle = await deployDepositWallet(client).catch(() => null);
+    if (handle) await handle.wait().catch(() => {});
+    logger.info('Gasless wallet deployment invoked');
   }
 
-  // setupTradingApprovals is now idempotent per SDK update.
-  const handle = await client.setupTradingApprovals();
-  await handle.wait();
+  await client.setupTradingApprovals();
   logger.info('CTF + ERC20 trading approvals confirmed on-chain');
 }
 

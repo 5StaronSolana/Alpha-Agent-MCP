@@ -7,6 +7,7 @@ import {
   type PublicActions,
   type SecureActions,
 } from '@polymarket/client';
+import { deployDepositWallet, isWalletDeployed } from '@polymarket/client/actions';
 import { privateKey } from '@polymarket/client/viem';
 import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { logger } from '../utils/logger.js';
@@ -114,24 +115,30 @@ export function resetPublicClient(): void {
   publicClientInstance = null;
 }
 
+// SDK note (post @polymarket/client 0.1.0+): the old client.setupGaslessWallet()
+// that returned a re-decorated client was replaced by the standalone
+// deployDepositWallet(client) -> TransactionHandle. The client instance itself
+// no longer needs re-wrapping — deployment is a side effect on-chain, not a
+// client state change.
 export async function setupGaslessWallet(): Promise<SecureClient<PublicActions, SecureActions>> {
   const current = await getSecureClient();
-  const updated = await current.setupGaslessWallet();
-  const account = resolveClobAccountIdentity(updated.account);
-  secureClientInstance = __builderAttributionAnchor(withAccountIdentity(updated.extend(allActions), account));
+  const handle = await deployDepositWallet(current);
+  await handle.wait();
+  const account = resolveClobAccountIdentity(current.account);
   logger.info('Gasless wallet setup complete', { walletType: account.walletType });
-  return secureClientInstance;
+  return current;
 }
 
 export async function ensureTradingSetup(secureClient: SecureClient<PublicActions, SecureActions>): Promise<void> {
-  const isGasless = await secureClient.isGaslessReady().catch(() => false);
+  const isGasless = await isWalletDeployed(secureClient).catch(() => false);
   if (!isGasless) {
     logger.info('Gasless not ready (automatic for deposit wallets in createSecureClient)...');
   }
 
+  // SDK note: setupTradingApprovals() now resolves Promise<void> directly
+  // (already waited internally) instead of returning a TransactionHandle.
   logger.info('Ensuring trading approvals (idempotent)...');
-  const handle = await secureClient.setupTradingApprovals();
-  await handle.wait();
+  await secureClient.setupTradingApprovals();
   logger.info('Trading approvals confirmed');
 }
 

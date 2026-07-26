@@ -170,13 +170,13 @@ MCP: create_api_key / derive / create_or_derive / fetch_api_keys / delete_api_ke
 
 ### 6. Wallet & Onchain / Gasless (secure + Advanced)
 - client.approveToken(token, amount)
-- client.deployDepositWallet()
+- deployDepositWallet(client) — standalone function, not a client method; returns a TransactionHandle
 - client.getDepositWallet()
-- client.isGaslessReady()
+- isWalletDeployed(client) — standalone function, not a client method; returns boolean
 - client.waitForGaslessTransaction(txHash)
 - Gasless approval + transaction workflows
 
-Per latest SDK (Jun 2026 commits): createSecureClient defaults wallet to signer's Deposit (auto-deploy if DEPOSIT_WALLET); setupGaslessWallet @deprecated no-op (setup at creation); setupTradingApprovals idempotent.
+Per SDK (0.1.0+): createSecureClient defaults wallet to signer's Deposit (auto-deploy if DEPOSIT_WALLET). There is no client.setupGaslessWallet()/client.isGaslessReady() anymore — use the standalone deployDepositWallet(client) / isWalletDeployed(client) functions. setupTradingApprovals() is idempotent and resolves Promise<void> directly (no separate .wait()).
 
 MCP: approve_erc20, approve_erc1155_for_all, deploy_deposit_wallet, fetch_deposit_wallet, setup_gasless_wallet (compat), is_gasless_ready (implicit), setup_trading_approvals (idempotent), split/merge/redeem_positions, prepare_* family, send_transaction (very sensitive), update_balance_allowance, fetch_balance_allowance (standalone for reliability).
 
