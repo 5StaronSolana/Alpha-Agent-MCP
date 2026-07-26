@@ -18,6 +18,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { getGuardrails, checkOrderAgainstGuardrails } from './mcp/guardrails.js';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { getPublicClient, getSecureClient } from './lib.js';
@@ -94,6 +95,33 @@ process.env.MCP_SERVER = 'true';
 // It is a supporting surface, not the brain. Partial updates via update_strategy; retrieve with get_strategies.
 // Persist critical long-term ones to the host's primary memory (e.g. Honcho). Lost on MCP restart otherwise.
 const strategyStore = new Map<string, any>(); // composite key (e.g. market:volume or tokenId) -> rules the host (Hermes) owns and drives via heartbeat
+
+/**
+ * Enforcement point for every order-placing tool. Reads "guardrails:global"
+ * from strategyStore (default readOnly until the owner configures it — see
+ * mcp/guardrails.ts) and returns a formatted block response if the order
+ * doesn't pass, or null if it's clear to place.
+ */
+function guardBlockOrThrough(
+  order: { tokenId: string; price: number; size: number; side: string },
+  context: { currentMid?: number; openOrderCount?: number } = {}
+): { isError: true; content: [{ type: 'text'; text: string }] } | null {
+  const guardrails = getGuardrails(strategyStore);
+  const result = checkOrderAgainstGuardrails(order, guardrails, context);
+  if (result.ok) return null;
+  return {
+    isError: true,
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify({
+        blocked: true,
+        reason: result.reason,
+        agentDirective: 'This order was blocked by local guardrails, not by Polymarket. Relay this to your owner — they need to call update_strategy({ tokenId: "guardrails:global", ... }) to adjust guardrails before this can succeed.',
+      }, null, 2),
+    }],
+  };
+}
+
 function getStrategyKey(tokenId: string, market?: string) {
   return market ? `${tokenId}:${market}` : tokenId;
 }
@@ -925,6 +953,34 @@ const publicTools = [
 
 
 const secureTools = [
+  {
+    name: 'update_strategy',
+    description: "[Config] Merge fields into the local strategy/guardrails bag under a composite key. The one required use: update_strategy({ tokenId: \"guardrails:global\", readOnly: false, maxOrderSizeUsd?, maxPriceDeviationFromMid?, allowedTokenIds?, maxOpenOrdersTotal? }) — this is the ONLY way to allow order placement; every place_* tool is blocked (readOnly) until this is called at least once. Also usable as a general free-form rules bag for your own strategy under any other tokenId key.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tokenId: { type: 'string', description: 'Composite key, e.g. "guardrails:global" or a real tokenId for your own strategy notes.' },
+        market: { type: 'string', description: 'Optional, combined with tokenId into "tokenId:market" — omit for guardrails:global.' },
+        readOnly: { type: 'boolean' },
+        maxOrderSizeUsd: { type: 'number' },
+        maxPriceDeviationFromMid: { type: 'number' },
+        allowedTokenIds: { type: 'array', items: { type: 'string' } },
+        maxOpenOrdersTotal: { type: 'number' },
+      },
+      required: ['tokenId'],
+    },
+  },
+  {
+    name: 'get_strategies',
+    description: '[Config] Read the local strategy/guardrails bag. Pass tokenId to get one key (e.g. "guardrails:global" to check current trading permissions), or omit to list every stored key.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tokenId: { type: 'string', description: 'Optional — omit to return all stored keys.' },
+        market: { type: 'string' },
+      },
+    },
+  },
   {
     name: 'place_limit_order',
     description: '[Trading] SDK placeLimitOrder only: tokenId, price, size, side, postOnly?, expiration? (NO orderType on wire). GTC=default; GTD=set expiration unix sec. FOK/FAK→place_market_order. Requires EOA_PRIVATE_KEY + DEPOSIT_WALLET_ADDRESS.',
@@ -2560,6 +2616,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'estimate_market_price':
       return callWithFormat(() => pub.estimateMarketPrice(args), F.formatGeneric, name);
 
+    case 'update_strategy': {
+      const tokenId = String((args as any)?.tokenId ?? '');
+      if (!tokenId) {
+        return { isError: true, content: [{ type: 'text' as const, text: 'update_strategy requires tokenId (e.g. "guardrails:global").' }] };
+      }
+      const key = getStrategyKey(tokenId, (args as any)?.market);
+      const { tokenId: _t, market: _m, ...fields } = (args as any) || {};
+      const existing = (strategyStore.get(key) as Record<string, unknown>) || {};
+      const merged = { ...existing, ...fields };
+      strategyStore.set(key, merged);
+      persistStrategiesToDisk().catch(() => {});
+      return {
+        content: [{
+          type: 'text' as const,
+          text: F.toHumanReadable({ Key: key, Stored: merged }, 'Update Strategy'),
+        }],
+      };
+    }
+    case 'get_strategies': {
+      const tokenId = (args as any)?.tokenId;
+      if (tokenId) {
+        const key = getStrategyKey(String(tokenId), (args as any)?.market);
+        return {
+          content: [{ type: 'text' as const, text: F.toHumanReadable({ Key: key, Value: strategyStore.get(key) ?? null }, 'Get Strategies') }],
+        };
+      }
+      const all = Object.fromEntries(strategyStore.entries());
+      return {
+        content: [{ type: 'text' as const, text: F.toHumanReadable({ 'All Keys': all }, 'Get Strategies') }],
+      };
+    }
+
     // Secure tools — every response formatted. CTF actions use resolved tx card.
     case 'place_limit_order': {
       const normalized = normalizePlaceLimitOrderArgs(args);
@@ -2577,6 +2665,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
       const placeArgs = normalized.args;
+      const guardBlock1 = guardBlockOrThrough({
+        tokenId: String(placeArgs.tokenId),
+        price: Number(placeArgs.price),
+        size: Number(placeArgs.size),
+        side: String(placeArgs.side),
+      });
+      if (guardBlock1) return guardBlock1;
       return callWithFormat(async () => {
         const posted = await (await getSec()).placeLimitOrder(placeArgs);
         const orderId = (posted as any)?.orderId;
@@ -2585,10 +2680,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }, F.formatOrderResponse, name);
     }
 
-    case 'place_maker_reward_order':
+    case 'place_maker_reward_order': {
       // STRICT "Only place orders that earn maker rewards" tool.
       // This is the recommended tool when you want the agent to ONLY succeed on orders that are earning rewards.
       // It will auto-cancel and return failure if the order does not become scoring within the check window.
+      const guardBlock2 = guardBlockOrThrough({
+        tokenId: String(args.tokenId),
+        price: Number(args.price),
+        size: Number(args.size),
+        side: String(args.side),
+      });
+      if (guardBlock2) return guardBlock2;
       return callWithFormat(async () => {
         const sec = await getSec();
 
@@ -2822,6 +2924,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
       }, F.formatGeneric, name);
+    }
 
     // === New Maker Rewards Support Tools ===
     case 'list_reward_markets': {
@@ -3264,6 +3367,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case 'place_optimized_reward_order': {
       // High-level automation helper: Suggest → Validate → Place (with optional monitoring)
+      // Fail fast on readOnly before doing any suggestion/book-fetch work.
+      if (getGuardrails(strategyStore).readOnly) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              blocked: true,
+              reason: 'readOnly guardrail is set — no orders may be placed. update_strategy({ tokenId: "guardrails:global", readOnly: false }) to allow trading.',
+              agentDirective: 'This order was blocked by local guardrails, not by Polymarket. Relay this to your owner — they need to call update_strategy({ tokenId: "guardrails:global", ... }) to adjust guardrails before this can succeed.',
+            }, null, 2),
+          }],
+        };
+      }
       return callWithFormat(async () => {
         const { tokenId } = await resolveTokenIdFromToolArgs({
           tokenId: args.tokenId,
@@ -3310,6 +3427,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const programs = (rewards?.items || []).slice(0, 5);
           return { ok: true, programsCount: programs.length };
         })();
+
+        // Guardrails, now that real computed price/size exist. Checked here
+        // (not just the early readOnly gate above) so maxOrderSizeUsd /
+        // maxPriceDeviationFromMid / allowedTokenIds also apply to the
+        // suggested order, not just an explicit one.
+        const fullGuardCheck = checkOrderAgainstGuardrails(
+          { tokenId: placeTokenId, price: suggestion.price, size: suggestion.size, side: args.side },
+          getGuardrails(strategyStore),
+          {}
+        );
+        if (!fullGuardCheck.ok) {
+          return {
+            success: false,
+            blocked: true,
+            reason: fullGuardCheck.reason,
+            agentDirective: 'This order was blocked by local guardrails, not by Polymarket. Relay this to your owner — they need to call update_strategy({ tokenId: "guardrails:global", ... }) to adjust guardrails before this can succeed.',
+          };
+        }
 
         // Step 3: Place using the strict tool logic
         const placeResult = await (async () => {
@@ -3598,13 +3733,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     // update_strategy case removed (custom strategy meta tool)
 
-    case 'place_market_order':
+    case 'place_market_order': {
+      // Market orders have no explicit price (amount/shares only). Represent
+      // notional as size with price=1 so maxOrderSizeUsd still applies to the
+      // one number we reliably have (USD amount on BUY); readOnly and
+      // allowedTokenIds apply unconditionally either way.
+      const notionalEstimate = Number((args as any)?.amount ?? (args as any)?.shares ?? 0) || 0;
+      const guardBlock3 = guardBlockOrThrough({
+        tokenId: String((args as any)?.tokenId),
+        price: 1,
+        size: notionalEstimate,
+        side: String((args as any)?.side),
+      });
+      if (guardBlock3) return guardBlock3;
       return callWithFormat(async () => {
         const posted = await (await getSec()).placeMarketOrder(args);
         const orderId = (posted as any)?.orderId;
         if (orderId) resourceManager.ensureUserSubscriptionForWatch(orderId).catch(() => {});
         return posted;
       }, F.formatOrderResponse, name);
+    }
     case 'cancel_order':
       return callWithFormat(async () => (await getSec()).cancelOrder(args), F.formatCancelResponse, name);
     case 'cancel_orders':
