@@ -53,7 +53,7 @@ No parsing. No field extraction. No formatting logic upstream.
 One command, no manual build step — point your agent host's MCP config directly at this:
 
 ```bash
-npx -y -p github:Ghost-Network666/Alpha-Agent-MCP alpha-agent-mcp
+npx -y -p github:5StaronSolana/Alpha-Agent-MCP alpha-agent-mcp
 ```
 
 (`-p ... alpha-agent-mcp` names the bin explicitly — this package also ships
@@ -68,7 +68,7 @@ first run, then starts the stdio server. For an `mcpServers`-style host config:
   "mcpServers": {
     "alpha-agent-mcp": {
       "command": "npx",
-      "args": ["-y", "-p", "github:Ghost-Network666/Alpha-Agent-MCP", "alpha-agent-mcp"]
+      "args": ["-y", "-p", "github:5StaronSolana/Alpha-Agent-MCP", "alpha-agent-mcp"]
     }
   }
 }
@@ -77,7 +77,7 @@ first run, then starts the stdio server. For an `mcpServers`-style host config:
 Prefer a local clone (e.g. to read or modify the code)? Same result, one more step:
 
 ```bash
-git clone https://github.com/Ghost-Network666/Alpha-Agent-MCP.git
+git clone https://github.com/5StaronSolana/Alpha-Agent-MCP.git
 cd Alpha-Agent-MCP
 npm install              # builds automatically via the prepare script
 node dist/mcp.js          # stdio MCP server — plug into any agent harness
