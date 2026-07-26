@@ -50,10 +50,37 @@ No parsing. No field extraction. No formatting logic upstream.
 
 ## Setup
 
+One command, no manual build step — point your agent host's MCP config directly at this:
+
 ```bash
-npm install
-npm run build
-node dist/mcp.js        # stdio MCP server — plug into any agent harness
+npx -y -p github:Ghost-Network666/Alpha-Agent-MCP alpha-agent-mcp
+```
+
+(`-p ... alpha-agent-mcp` names the bin explicitly — this package also ships
+a second, unrelated CLI (`polymarket-client`), so a bare `npx github:...`
+can't guess which one you want.)
+
+`npx` clones, installs, and builds automatically (via the `prepare` script) on
+first run, then starts the stdio server. For an `mcpServers`-style host config:
+
+```json
+{
+  "mcpServers": {
+    "alpha-agent-mcp": {
+      "command": "npx",
+      "args": ["-y", "-p", "github:Ghost-Network666/Alpha-Agent-MCP", "alpha-agent-mcp"]
+    }
+  }
+}
+```
+
+Prefer a local clone (e.g. to read or modify the code)? Same result, one more step:
+
+```bash
+git clone https://github.com/Ghost-Network666/Alpha-Agent-MCP.git
+cd Alpha-Agent-MCP
+npm install              # builds automatically via the prepare script
+node dist/mcp.js          # stdio MCP server — plug into any agent harness
 ```
 
 Required env vars:

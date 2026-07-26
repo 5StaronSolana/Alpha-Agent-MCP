@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // @ts-nocheck -- SDK beta types + heavy use of loose Record args for flexibility (pre-existing pattern across the file)
 import { loadProjectEnv } from './config/load-env.js';
 
