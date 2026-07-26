@@ -2538,27 +2538,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const withMeta = { ...res, _used: used };
       return callWithFormat(() => Promise.resolve(withMeta), F.formatSearchResults, name);
     }
-    case 'list_tags': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat(
-        pub.listTags(callArgs as Record<string, unknown>),
-        F.formatTag,
-        name,
-        lim,
-        off
-      );
-    }
     case 'list_sports': {
       const lim = sanitizePageSize(args);
       const off = Number((args as any)?.offset ?? 0) || 0;
       return callWithFormat(() => pub.listSports({ pageSize: lim, limit: lim, offset: off } as any), F.formatGeneric, name);
     }
-    case 'list_teams':
-      return callWithFormat(() => pub.listTeams(), F.formatGeneric, name);
-    case 'fetch_tag':
-      return callWithFormat(() => pub.fetchTag(args), F.formatGeneric, name);
     case 'get_order_book': {
       try {
         const { tokenId, resolvedFrom, marketQuestion } = await resolveTokenIdFromToolArgs(args);
@@ -3254,17 +3238,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify({ success: true, activity: items, source: 'Direct SDK listActivity' }) }] };
       } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
     }
-    case 'list_trades': {
-      try {
-        const sec = await getSecureClient();
-        const maker = args.maker;
-        // SDK supports listTrades via actions or attached.
-        const pag = await (typeof (sec as any).listTrades === 'function' ? (sec as any).listTrades({ maker, pageSize: sanitizePageSize(args) }) : sec.listActivity({ pageSize: sanitizePageSize(args) }));
-        const page = await (typeof pag.firstPage === 'function' ? pag.firstPage() : pag);
-        const items = (page?.items || []).map((t: any) => F.formatActivity ? F.formatActivity(t) : t);
-        return { content: [{ type: 'text', text: JSON.stringify({ success: true, trades: items, maker, source: 'Direct SDK listTrades / activity' }) }] };
-      } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
-    }
     case 'create_limit_order': {
       // Sign only; use the place logic but without post, or direct create.
       const { tokenId } = await resolveTokenIdFromToolArgs(args);
@@ -3321,14 +3294,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify({ success: true, tags }) }] };
       } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
     }
-    case 'list_sports': {
-      try {
-        const pub = getPublicClient();
-        // SDK has listSports via actions or gamma.
-        const sports = await (pub as any).listSports ? (pub as any).listSports({}) : pub.listEvents({ category: 'sports' });
-        return { content: [{ type: 'text', text: JSON.stringify({ success: true, sports: sports.items || sports, source: 'SDK sports metadata' }) }] };
-      } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
-    }
     case 'get_midpoint': {
       try {
         const pub = getPublicClient();
@@ -3337,39 +3302,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify({ success: true, tokenId, midpoint: mid }) }] };
       } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
     }
-    case 'fetch_event': {
-      try {
-        const pub = getPublicClient();
-        const event = await pub.fetchEvent ? pub.fetchEvent({ id: args.id, slug: args.slug }) : pub.getEvent ? pub.getEvent(args.id || args.slug) : null;
-        return { content: [{ type: 'text', text: JSON.stringify({ success: true, event: F.formatEvent ? F.formatEvent(event) : event }) }] };
-      } catch (e: any) { return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }) }] }; }
-    }
-
-    // Added for full SDK coverage (WS, gasless, raw rewards, account, etc.)
-    case 'subscribe_market': { const t = args.tokenId; if(!t) return {isError:true,content:[{type:'text',text:'tokenId required'}]}; await resourceManager.ensureMarketSubscription(t, `polymarket://market/${t}/book`).catch(()=>{}); return {content:[{type:'text',text:JSON.stringify({success:true,resource:`polymarket://market/${t}/book`,note:'SDK WS via resource'})}]}; }
-    case 'subscribe_sports': { return {content:[{type:'text',text:JSON.stringify({success:true,topic:'sports'})}]}; }
-    case 'subscribe_user': { await resourceManager.ensureUserSubscription('polymarket://user/orders').catch(()=>{}); return {content:[{type:'text',text:JSON.stringify({success:true,resources:['polymarket://user/*']})}]}; }
-    case 'subscribe_prices_crypto': { return {content:[{type:'text',text:JSON.stringify({success:true,topic:'prices.crypto'})}]}; }
-    case 'subscribe_wallet_activity': { const a=String(args.address||'').trim(); if(!a.toLowerCase().startsWith('0x')) return {isError:true,content:[{type:'text',text:'address required'}]}; const u=`polymarket://wallet/${a}/activity`; await resourceManager.subscribe(u).catch(()=>{}); return {content:[{type:'text',text:JSON.stringify({success:true,resource:u, note:'On-chain viem listener active for public wallet activity. Use read_resource on the uri. No guessing — standard MCP resource flow.', agentDirective:'Use read_resource on the returned uri for current activity; rely on resources/updated for realtime. The agent controls when and how to track this wallet (pair with list_trades maker + strategy updates).'})}]}; }
-    case 'list_current_rewards': { try{const p=getPublicClient();const lim=sanitizePageSize(args);const off=Number((args as any)?.offset??0)||0;const c=await callWithRateLimitProtection(()=>p.listCurrentRewards({pageSize:lim,offset:off,limit:lim}),'listCurrentRewards');if(!c.ok)throw new Error(c.message);const pg=await (c.data.firstPage?c.data.firstPage():c.data);const items=pg?.items||[];return{content:[{type:'text',text:JSON.stringify({items,total:(pg as any)?.total,limit:lim,offset:off,nextCursor:(pg as any)?.nextCursor,source:'Direct SDK listCurrentRewards'},null,2)}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:(e as any).message})}]};} }
-    case 'list_market_rewards': { try{const p=getPublicClient();const cid=args.conditionId;if(!cid)throw new Error('conditionId required');const c=await callWithRateLimitProtection(()=>p.listMarketRewards({conditionId:cid}),'listMarketRewards');if(!c.ok)throw new Error(c.message);return{content:[{type:'text',text:JSON.stringify({success:true,rewards:c.data||{},source:'Direct SDK listMarketRewards'})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'order_scoring': { return {content:[{type:'text',text:JSON.stringify({success:true,note:'Scoring context via SDK rewards/farmability.'})}]}; }
-    case 'batch_order_scoring': { return {content:[{type:'text',text:JSON.stringify({success:true,note:'Batch via SDK.'})}]}; }
-    case 'get_portfolio_value': { try{const s=await getSecureClient();const v=await s.fetchPortfolioValue();return{content:[{type:'text',text:JSON.stringify(F.formatPortfolioValue(v))}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'list_activity': { try{const s=await getSecureClient();const lim=sanitizePageSize(args);const off=Number((args as any)?.offset??0)||0;const pag=await s.listActivity({pageSize:lim,limit:lim,offset:off});const pg=await (typeof pag.firstPage==='function'?pag.firstPage():pag);const it=(pg?.items||[]).map((a:any)=>F.formatActivity(a));const total=(pg as any)?.total;const nc=(pg as any)?.nextCursor;return{content:[{type:'text',text:JSON.stringify({items:it,total,limit:lim,offset:off,nextCursor:nc,source:'Direct SDK listActivity'},null,2)}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:(e as any).message})}]};} }
-    case 'list_trades': { try{const s=await getSecureClient();const lim=sanitizePageSize(args);const off=Number((args as any)?.offset??0)||0;const maker=(args as any)?.maker;const pag=await (typeof (s as any).listTrades==='function'?(s as any).listTrades({maker,pageSize:lim,limit:lim,offset:off}):s.listActivity({pageSize:lim,limit:lim,offset:off}));const pg=await (typeof pag.firstPage==='function'?pag.firstPage():pag);const it=(pg?.items||[]).map((t:any)=>F.formatActivity?F.formatActivity(t):t);const total=(pg as any)?.total;const nc=(pg as any)?.nextCursor;return{content:[{type:'text',text:JSON.stringify({items:it,total,limit:lim,offset:off,nextCursor:nc,source:'Direct SDK listTrades'},null,2)}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:(e as any).message})}]};} }
-    case 'create_limit_order': { const {tokenId}=await resolveTokenIdFromToolArgs(args);return{content:[{type:'text',text:JSON.stringify({success:true,note:'createLimitOrder sign-only via SDK.',tokenId,price:args.price,size:args.size,side:args.side})}]}; }
-    case 'create_market_order': { const {tokenId}=await resolveTokenIdFromToolArgs(args);return{content:[{type:'text',text:JSON.stringify({success:true,note:'createMarketOrder sign-only.',tokenId,amount:args.amount,side:args.side})}]}; }
-    case 'cancel_market_orders': { try{const s=await getSecureClient();await (s.cancelMarketOrders||s.cancelAllOrders).call(s,{market:args.market});return{content:[{type:'text',text:JSON.stringify({success:true})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'cancel_all_orders': { try{const s=await getSecureClient();await (s.cancelAllOrders||(async()=>{const os=await s.listOpenOrders({});for(const o of (os.items||[]))await s.cancelOrder({orderId:o.id});})).call(s);return{content:[{type:'text',text:JSON.stringify({success:true})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'fetch_order': { try{const s=await getSecureClient();const o=await s.fetchOrder({orderId:args.orderId});return{content:[{type:'text',text:JSON.stringify(F.formatOrder(o))}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'get_order_history': { try{const s=await getSecureClient();const pag=await s.listActivity({pageSize:sanitizePageSize(args)});const pg=await (typeof pag.firstPage==='function'?pag.firstPage():pag);const h=(pg?.items||[]).filter((a:any)=>a.type==='ORDER'||a.type==='TRADE').map((o:any)=>F.formatOrder?F.formatOrder(o):o);return{content:[{type:'text',text:JSON.stringify({success:true,history:h})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'list_comments': { try{const p=getPublicClient();const lim=sanitizePageSize(args);const off=Number((args as any)?.offset??0)||0;const pag=await (p.listComments?p.listComments({market:(args as any).market,event:(args as any).event,pageSize:lim,limit:lim,offset:off}):p.listActivity({pageSize:lim,limit:lim,offset:off}));const pg=await (typeof pag.firstPage==='function'?pag.firstPage():pag);const it=(pg?.items||[]).map((c:any)=>F.formatActivity?F.formatActivity(c):c);const total=(pg as any)?.total;const nc=(pg as any)?.nextCursor;return{content:[{type:'text',text:JSON.stringify({items:it,total,limit:lim,offset:off,nextCursor:nc},null,2)}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:(e as any).message})}]};} }
-    case 'fetch_market_tags': { try{const p=getPublicClient();const t=await p.fetchMarketTags({id:args.id});return{content:[{type:'text',text:JSON.stringify({success:true,tags:t})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'list_sports': { try{const p=getPublicClient();const s=await ((p as any).listSports?(p as any).listSports({}):p.listEvents({category:'sports'}));return{content:[{type:'text',text:JSON.stringify({success:true,sports:s.items||s})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'get_midpoint': { try{const p=getPublicClient();const {tokenId}=await resolveTokenIdFromToolArgs(args);const m=await p.fetchMidpoint({tokenId});return{content:[{type:'text',text:JSON.stringify({success:true,midpoint:m})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-    case 'fetch_event': { try{const p=getPublicClient();const ev=await (p.fetchEvent?p.fetchEvent({id:args.id,slug:args.slug}):null);return{content:[{type:'text',text:JSON.stringify({success:true,event:ev})}]};}catch(e){return{content:[{type:'text',text:JSON.stringify({success:false,error:e.message})}]};} }
-
     case 'list_active_maker_reward_markets': {
       const maxResults = Math.min(Math.max(1, args.maxResults || 5), 20);
       const maxMinSize = args.maxMinSize != null ? parseFloat(args.maxMinSize) : undefined;
@@ -3806,40 +3738,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return callWithFormat(async () => (await getSec()).cancelOrders(args), F.formatCancelResponse, name);
     case 'cancel_all':
       return callWithFormat(async () => (await getSec()).cancelAll(), F.formatCancelResponse, name);
-    case 'cancel_market_orders':
-      return callWithFormat(async () => (await getSec()).cancelMarketOrders(args), F.formatCancelResponse, name);
     case 'list_open_orders': {
       const lim = sanitizePageSize(args);
       const off = Number((args as any)?.offset ?? 0) || 0;
       const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
       return callPaginatedWithFormat((await getSec()).listOpenOrders(callArgs), F.formatOrder, name, lim, off);
-    }
-    case 'fetch_order':
-      return callWithFormat(async () => (await getSec()).fetchOrder(args), F.formatOrder, name);
-    case 'watch_order_until_filled': {
-      // Starts/ensures watching + returns the dedicated fill-status resource URI
-      const orderId = args.orderId;
-      const timeout = args.timeoutSeconds || 300;
-      // Ensure the authenticated user subscription is active (it powers fill notifications)
-      try {
-        await resourceManager.ensureUserSubscriptionForWatch(orderId);
-      } catch (e) {
-        // Non-fatal — the resource can still be polled via fetch_order
-      }
-      const watchUri = `polymarket://order/${orderId}/fill-status`;
-      return {
-        content: [{
-          type: 'text' as const,
-          text: JSON.stringify({
-            'Status': 'WATCHING',
-            'Order Id': orderId,
-            'Resource': watchUri,
-            'Description': 'Subscribe to the resource above for live fill updates. This watch was automatically registered.',
-            'Timeout Seconds': timeout,
-            'Note': 'You will receive resource/updated notifications when this order is filled (partially or fully).'
-          }, null, 2)
-        }]
-      };
     }
     case 'list_positions': {
       // SDK listPositions returns a Paginator — use firstPage(), not raw .map on the paginator object
@@ -3873,24 +3776,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { isError: true, content: [{ type: 'text' as const, text: `list_positions error: ${e?.message || e}` }] };
       }
     }
-    case 'list_closed_positions': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat((await getSec()).listClosedPositions?.(callArgs) ?? Promise.resolve({ items: [] }), F.formatClosedPosition, name, lim, off);
-    }
     case 'fetch_portfolio_value':
       return callWithFormat(async () => (await getSec()).fetchPortfolioValue(), F.formatPortfolioValue, name);
-    case 'list_activity': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat((await getSec()).listActivity(callArgs), F.formatActivity, name, lim, off);
-    }
-    case 'list_account_trades':
-      return callPaginatedWithFormat((await getSec()).listAccountTrades(args), F.formatTrade, name);
-
-    // === Leaderboards + Public Profiles ===
     case 'list_builder_leaderboard':
       return callPaginatedWithFormat(pub.listBuilderLeaderboard(args), F.formatLeaderboardEntry, name);
     case 'list_trader_leaderboard':
@@ -3899,18 +3786,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return callWithFormat(() => pub.fetchPublicProfile(args), F.formatPublicProfile, name);
 
     // === Reward Tracking (viewing only) ===
-    case 'list_current_rewards': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat(pub.listCurrentRewards(callArgs), F.formatCurrentReward, name, lim, off);
-    }
-    case 'list_market_rewards': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat(pub.listMarketRewards(callArgs), F.formatMarketReward, name, lim, off);
-    }
     case 'fetch_reward_percentages':
       return callWithFormat(async () => (await getSec()).fetchRewardPercentages(), F.formatRewardsPercentages, name);
     case 'list_user_earnings_and_markets_config':
@@ -3921,10 +3796,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // === Additional Analytics ===
     case 'list_builder_trades':
       return callPaginatedWithFormat(pub.listBuilderTrades(args), F.formatBuilderTrade, name);
-    case 'fetch_builder_volume':
-      return callWithFormat(() => pub.fetchBuilderVolume(args), F.formatBuilderVolume, name);
-
-    // === Additional Rewards (secure) ===
     case 'fetch_order_scoring':
       return callWithFormat(async () => (await getSec()).fetchOrderScoring(args), F.formatOrderScoring, name);
     case 'fetch_orders_scoring':
@@ -3947,55 +3818,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return callWithFormat(async () => (await getSec()).fetchTotalEarningsForUserForDay(args), F.formatGeneric, name);
 
     // === Additional Discovery (list_tags handled above) ===
-    case 'fetch_tag':
-      return callWithFormat(() => pub.fetchTag(args), F.formatTag, name);
-    case 'fetch_related_tags':
-      return callWithFormat(() => pub.fetchRelatedTags(args), F.formatRelatedTag, name);
-
-    // Comments
-    case 'list_comments': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat(pub.listComments(callArgs), F.formatComment, name, lim, off);
-    }
     case 'fetch_comment':
       return callWithFormat(() => pub.fetchCommentsById(args), (arr: any[]) => (arr || []).map(F.formatComment), name);
     case 'list_comments_by_user_address':
       return callPaginatedWithFormat(pub.listCommentsByUserAddress(args), F.formatComment, name);
 
-    case 'list_series': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat(pub.listSeries(callArgs), F.formatSeries, name, lim, off);
-    }
-    case 'fetch_series':
-      return callWithFormat(() => pub.fetchSeries(args), F.formatSeries, name);
-
-    // === Data Enhancements ===
-    case 'list_market_holders':
-      return callWithFormat(() => pub.listMarketHolders(args), F.formatMarketHolder, name);
-    case 'list_open_interest':
-      return callWithFormat(() => pub.listOpenInterest(args), F.formatOpenInterest, name);
-    case 'fetch_event_live_volume':
-      return callWithFormat(() => pub.fetchEventLiveVolume(args), F.formatSimpleListItem, name);
-
-    // === Newly Added SDK Coverage (all formatted) ===
-    case 'list_teams': {
-      const lim = sanitizePageSize(args);
-      const off = Number((args as any)?.offset ?? 0) || 0;
-      const callArgs = { ...(args || {}), pageSize: lim, limit: lim, offset: off };
-      return callPaginatedWithFormat(pub.listTeams(callArgs), F.formatTeam, name, lim, off);
-    }
     case 'fetch_market_info':
       return callWithFormat(() => pub.fetchMarketInfo(args), F.formatMarketInfo, name);
     case 'fetch_midpoints':
       return callWithFormat(() => pub.fetchMidpoints(args), F.formatBatchPrices, name);
     case 'fetch_spreads':
       return callWithFormat(() => pub.fetchSpreads(args), F.formatBatchPrices, name);
-    case 'fetch_builder_fee_rates':
-      return callWithFormat(() => pub.fetchBuilderFeeRates(args), F.formatBuilderFeeRates, name);
     case 'fetch_traded_market_count':
       return callWithFormat(() => pub.fetchTradedMarketCount(args), F.formatTradedMarketCount, name);
     case 'fetch_related_tag_resources':
@@ -4008,8 +3841,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     // === Sports (public) ===
-    case 'list_sports':
-      return callWithFormat(() => pub.listSports(args), F.formatSport, name);
     case 'fetch_sports_market_types':
       return callWithFormat(() => pub.fetchSportsMarketTypes(args), F.formatSportsMarketType, name);
 
@@ -4020,15 +3851,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return callWithFormat(() => pub.fetchOrderBooks(args), F.formatBatchOrderBooks, name);
 
     // === Metadata (public) ===
-    case 'fetch_event_tags':
-      return callWithFormat(() => pub.fetchEventTags(args), F.formatSimpleListItem, name);
-    case 'fetch_market_tags': {
-      const base = await callWithFormat(() => pub.fetchMarketTags(args), F.formatSimpleListItem, name);
-      if (base && base.content && base.content[0] && base.content[0].text && !base.isError) {
-        base.content[0].text += '\n\n**Note:** These are the live tags. Use these slugs with list_events for accurate discovery.';
-      }
-      return base;
-    }
     case 'fetch_neg_risk':
       return callWithFormat(() => pub.fetchNegRisk(args), F.formatNegRisk, name);
     case 'fetch_tick_size':
@@ -4038,20 +3860,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     // === Account / Wallet ===
 
-    case 'fetch_notifications':
-      // Use compact by default for agents (full details can be heavy)
-      const notifCompact = true; // could later make this configurable
-      return callWithFormat(async () => (await getSec()).fetchNotifications(), notifCompact ? F.formatNotificationCompact : F.formatGeneric, name);
-    case 'drop_notifications':
-      return callWithFormat(async () => (await getSec()).dropNotifications(args), F.formatGeneric, name);
     case 'fetch_closed_only_mode':
       return callWithFormat(async () => (await getSec()).fetchClosedOnlyMode(), F.formatGeneric, name);
-    case 'fetch_deposit_wallet':
-      return callWithFormat(async () => (await getSec()).getDepositWallet?.(args) || /* resolve via actions or client */ { note: 'deposit wallet derivation' }, F.formatGeneric, name);
     case 'get_profile':
       return callWithFormat(async () => (await getSec()).getProfile?.(args) || {}, F.formatGeneric, name);
-    case 'update_profile':
-      return callWithFormat(async () => (await getSec()).updateProfile?.(args) || { success: true }, F.formatGeneric, name);
     case 'post_comment':
       return callWithFormat(async () => (await getSec()).postComment?.(args) || { success: true }, F.formatGeneric, name);
 
@@ -4060,14 +3872,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return callWithFormat(async () => (await getSec()).prepareLimitOrder(args), F.formatPreparedTx, name);
     case 'prepare_market_order':
       return callWithFormat(async () => (await getSec()).prepareMarketOrder(args), F.formatPreparedTx, name);
-    case 'prepare_gasless_transaction':
-      return callWithFormat(async () => (await getSec()).prepareGaslessTransaction(args), F.formatPreparedTx, name);
-    case 'prepare_split_position':
-      return callWithFormat(async () => (await getSec()).prepareSplitPosition(args), F.formatPreparedTx, name);
-    case 'prepare_merge_positions':
-      return callWithFormat(async () => (await getSec()).prepareMergePositions(args), F.formatPreparedTx, name);
-    case 'prepare_redeem_positions':
-      return callWithFormat(async () => (await getSec()).prepareRedeemPositions(args), F.formatPreparedTx, name);
     case 'prepare_erc20_approval':
       return callWithFormat(async () => (await getSec()).prepareErc20Approval(args), F.formatPreparedTx, name);
     case 'prepare_erc1155_approval_for_all':
@@ -4125,12 +3929,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         await handle.wait();
         return handle;
       }, F.formatTransactionHandle, name);
-    case 'download_accounting_snapshot':
-      return callWithFormat(async () => (await getSec()).downloadAccountingSnapshot(args), F.formatAccountingSnapshot, name);
-    case 'fetch_transaction':
-      return callWithFormat(async () => (await getSec()).fetchTransaction(args), F.formatGaslessTx, name);
-
-    // === API Key actions (standalone from /actions; create* use pre-signed payloads + pub client) ===
     case 'create_api_key':
       return callWithFormat(() => createApiKey(pub, args), F.formatApiKey, name);
     case 'derive_api_key':
@@ -4148,34 +3946,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'revoke_builder_api_key':
       return callWithFormat(async () => { await revokeBuilderApiKey(await getSec()); return { success: true }; }, F.formatGeneric, name);
 
-    case 'generate_builder_headers': {
-      try {
-        const { generateBuilderHeaders } = await import('./config/client.js');
-        const headers = await generateBuilderHeaders(
-          String(args.method),
-          String(args.path),
-          args.body ? String(args.body) : undefined,
-          args.timestamp ? Number(args.timestamp) : undefined
-        );
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({ headers, note: 'Generated via @polymarket/builder-signing-sdk for official Builder API auth. Use these headers in gasless/builder flows. Integrated as the dedicated signing piece from Polymarket GitHub.' }, null, 2),
-          }],
-        };
-      } catch (error: any) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: `generate_builder_headers error: ${error?.message || String(error)}` }],
-        };
-      }
-    }
-
-    // ===================================================================
-    // SECURITY-SENSITIVE HANDLERS (added per explicit request)
-    // These provide direct access to raw wallet signing and transaction
-    // capabilities. They should only be used with additional safeguards.
-    // ===================================================================
     case 'sign_message': {
       try {
         const sec = await getSec();
