@@ -28,9 +28,19 @@
  *   normalization / suggestion, before any placeOrder / createLimitOrder / postOrder SDK call.
  * - On-chain state-changing actions (checkStateChangingActionAgainstGuardrails):
  *   split_position, merge_positions, redeem_positions, enable_auto_redeem,
- *   approve_erc20, approve_erc1155_for_all, update_balance_allowance.
+ *   approve_erc20, approve_erc1155_for_all, update_balance_allowance,
+ *   send_transaction, setup_trading_approvals, deploy_deposit_wallet's
+ *   sibling actions (deposit_to_perps, withdraw_from_perps,
+ *   revoke_perps_credentials, merge_combo_position, split_combo_position,
+ *   merge_market_position, split_market_position — wired via the stateGuard
+ *   passed into mcp/sdk-gap-tools.ts's handleGapTool, not imported directly
+ *   there), and the Perps session actions place_perps_position_tp_sl,
+ *   post_perps_orders, update_perps_leverage. Also the RFQ actions
+ *   respond_to_rfq_quote_request and cancel_rfq_quote.
  * - Transfers (checkTransferAgainstGuardrails, adds allowedTransferAddresses):
  *   transfer_erc20.
+ * - Perps orders (checkOrderAgainstGuardrails, instrumentId used in the
+ *   tokenId slot): place_perps_order.
  *
  * Observability: Current config + block attempts surface in get_mcp_usage (as a dedicated block)
  * and in mcp_doctor (synthetic checks run on every report for live verification).

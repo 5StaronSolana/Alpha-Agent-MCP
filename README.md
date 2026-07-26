@@ -26,9 +26,14 @@ The MCP layer absorbs all Polymarket complexity — auth, signature type resolut
 | **Live data (WebSocket)** | `subscribe_market`, `subscribe_user`, `subscribe_sports`, `subscribe_prices_crypto`, `subscribe_wallet_activity` via MCP Resources |
 | **Auth / setup** | `create_secure_client`, `setup_trading_approvals`, `setup_gasless_wallet`, `create_api_key`, `create_builder_api_key`, builder header signing |
 | **Analytics** | `get_trader_leaderboard`, `get_builder_leaderboard`, `list_market_holders`, `fetch_builder_volume`, `fetch_builder_fee_rates` |
-| **RFQ** | `create_rfq_request`, `submit_rfq_quote`, `get_rfq_quotes`, `confirm_rfq_trade` |
+| **RFQ** (quoter/market-maker side only — see caveat below) | `open_rfq_session`, `list_pending_rfq_quote_requests`, `respond_to_rfq_quote_request`, `cancel_rfq_quote`, `close_rfq_session` |
+| **Perps trading** (`@experimental` per Polymarket — see caveat below) | `open_perps_session`, `place_perps_order`, `post_perps_orders`, `place_perps_position_tp_sl`, `cancel_perps_order(s)`, `cancel_all_perps_orders`, `update_perps_leverage`, `fetch_perps_balances`/`portfolio`/`account_stats`/`account_config`/`open_orders`/`orders`, `list_perps_fills`/`funding_payments`/`deposits`/`withdrawals`/`equity_history`/`pnl_history`, `deposit_to_perps`, `withdraw_from_perps`, `revoke_perps_credentials`, plus public `fetch_perps_book`/`fees`/`instruments`/`ticker(s)` and `list_perps_candles`/`funding_history`/`trades` |
 
-90+ tools through a single stdio MCP server. Every tool is a 1:1 wrapper of `@polymarket/client` — no custom HTTP, no undocumented endpoints.
+180+ tools through a single stdio MCP server. Every tool is a 1:1 wrapper of `@polymarket/client` — no custom HTTP, no undocumented endpoints.
+
+**Two honesty caveats, not marketing:**
+- **Perps is entirely `@experimental`** in Polymarket's own SDK — every Perps method's doc comment says it "may change in a breaking way in any release, including patch releases." This coverage may need to change on any SDK bump, not just major ones. Placing a Perps order also opens leveraged exposure — same guardrails gate as spot orders applies (see Safety below), but the leverage risk itself is yours to manage.
+- **RFQ here is quoter (market-maker) side only.** `openRfqSession()` streams incoming `quote_request` events from takers and lets you respond with a price — there is currently no client-side "request a quote as a taker" function in this SDK version. If you want an agent that *requests* quotes rather than *answers* them, this SDK doesn't expose that yet. Check https://docs.polymarket.com/changelog/sdks#typescript — the SDK ships changes weekly.
 
 ---
 
@@ -94,9 +99,9 @@ Health check: `npm run doctor`
 
 ---
 
-## Safety — orders are blocked until you opt in
+## Safety — every fund-moving action is blocked until you opt in
 
-**By default, no order will be placed.** Until you explicitly configure guardrails, every `place_limit_order` / `place_market_order` / `place_optimized_reward_order` call is rejected with a `readOnly` block. This is deliberate: this server is designed to be pointed at a live, funded wallet and connected to an autonomous agent (OpenClaw, Hermes, or any MCP host), so it should never place a real order before its owner has decided what that agent is allowed to do.
+**By default, nothing that moves or approves access to your funds will execute.** Until you explicitly configure guardrails, every order tool (`place_limit_order`, `place_market_order`, `place_optimized_reward_order`, `place_perps_order`, ...), every on-chain action (split/merge/redeem positions, approvals, `transfer_erc20`, `send_transaction`, Perps deposit/withdraw, combo/market split-merge), and the Perps/RFQ actions that place orders or commit to a trade (`post_perps_orders`, `update_perps_leverage`, `respond_to_rfq_quote_request`, ...) are rejected with a `readOnly` block. This is deliberate: this server is designed to be pointed at a live, funded wallet and connected to an autonomous agent (OpenClaw, Hermes, or any MCP host), so it should never move funds or place a real order before its owner has decided what that agent is allowed to do.
 
 To allow trading, call `update_strategy`:
 
@@ -116,7 +121,7 @@ update_strategy({
 })
 ```
 
-Fields: `readOnly`, `maxOrderSizeUsd` (hard cap on notional per order), `maxPriceDeviationFromMid` (reject orders far from mid), `allowedTokenIds` (allowlist), `maxOpenOrdersTotal`. Unset fields impose no restriction on that dimension once you've configured the key at all. See `src/mcp/guardrails.ts`.
+Fields: `readOnly`, `maxOrderSizeUsd` (hard cap on notional per order), `maxPriceDeviationFromMid` (reject orders far from mid), `allowedTokenIds` (allowlist), `maxOpenOrdersTotal`, `allowedTransferAddresses` (allowlist for `transfer_erc20` recipients — a raw transfer has no exchange counterparty or price bound, so it gets its own stricter check). Unset fields impose no restriction on that dimension once you've configured the key at all. See `src/mcp/guardrails.ts`.
 
 ---
 

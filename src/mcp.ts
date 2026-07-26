@@ -172,6 +172,72 @@ function getStrategyKey(tokenId: string, market?: string) {
   return market ? `${tokenId}:${market}` : tokenId;
 }
 
+// ==================== PERPS SESSION (stateful, cached like getSecureClient) ====================
+//
+// openPerpsSession() returns a stateful, WebSocket-backed session object (not
+// a plain request/response call) — every method below the Perps-instrument
+// public reads (fetchPerpsBook etc., already wrapped in mcp/sdk-gap-tools.ts)
+// lives on this session, not the client. It must be connect()ed once and
+// reused, not reopened per tool call. The whole Perps API is marked
+// @experimental by Polymarket ("may change in a breaking way in any release,
+// including patch releases") — this wiring may need to change on any SDK bump,
+// not just major ones. See https://docs.polymarket.com/changelog/sdks.
+let perpsSessionInstance: any = null;
+async function getPerpsSession(): Promise<any> {
+  if (!perpsSessionInstance || perpsSessionInstance.closed) {
+    const sec = await getSecureClient();
+    perpsSessionInstance = await sec.openPerpsSession();
+    await perpsSessionInstance.connect();
+  }
+  return perpsSessionInstance;
+}
+async function closePerpsSession(): Promise<void> {
+  if (perpsSessionInstance && !perpsSessionInstance.closed) {
+    await perpsSessionInstance.close().catch(() => {});
+  }
+  perpsSessionInstance = null;
+}
+
+// ==================== RFQ SESSION (quoter/market-maker side only) ====================
+//
+// openRfqSession() is the *quoter* side of Polymarket's RFQ system: it
+// streams incoming quote_request events from takers, and you respond via
+// event.quote({ price, size? }). There is no client-side "request a quote as
+// a taker" function in this SDK version — that flow isn't exposed here. The
+// previous create_rfq_request/submit_rfq_quote/get_rfq_quotes/
+// confirm_rfq_trade tools called client methods that never existed and
+// silently fell back to fabricated placeholder data; they're replaced below
+// with the real (quoter-only) surface, documented as such.
+let rfqSessionInstance: any = null;
+const rfqPendingQuoteRequests = new Map<string, any>(); // reference id -> live event (with .quote()/.reject())
+async function getRfqSession(): Promise<any> {
+  if (!rfqSessionInstance) {
+    const sec = await getSecureClient();
+    rfqSessionInstance = await sec.openRfqSession();
+    (async () => {
+      try {
+        for await (const event of rfqSessionInstance) {
+          if (event?.type === 'quote_request') {
+            const id = event.requestId ?? event.id ?? `rfq_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            rfqPendingQuoteRequests.set(String(id), event);
+          }
+        }
+      } catch {
+        // Session closed or connection lost — background consumer exits quietly;
+        // next getRfqSession() call re-opens if the tools are used again.
+      }
+    })();
+  }
+  return rfqSessionInstance;
+}
+async function closeRfqSession(): Promise<void> {
+  if (rfqSessionInstance) {
+    await rfqSessionInstance.close().catch(() => {});
+  }
+  rfqSessionInstance = null;
+  rfqPendingQuoteRequests.clear();
+}
+
 async function persistStrategiesToDisk() {
   try {
     const obj: Record<string, unknown> = {};
@@ -1984,26 +2050,169 @@ const secureTools = [
     description: '[Realtime] Terminate all active WebSocket subscriptions.',
     inputSchema: { type: 'object', properties: {} }
   },
-  // RFQ system (complete; some may use subscribe + quote flows per SDK)
+  // RFQ system — quoter (market-maker) side only. openRfqSession() streams
+  // incoming quote_request events from takers; there is no client-side
+  // "request a quote as a taker" function in this SDK version. If you want
+  // your own agent to REQUEST quotes rather than respond to them, this SDK
+  // doesn't expose that path yet — check the changelog for updates:
+  // https://docs.polymarket.com/changelog/sdks
   {
-    name: 'create_rfq_request',
-    description: '[RFQ] Signal intent to trade a specific size (createRfqRequest).',
-    inputSchema: { type: 'object', properties: { tokenId: { type: 'string' }, side: { type: 'string' }, quantity: { type: 'number' } }, required: ['tokenId', 'side', 'quantity'] }
+    name: 'open_rfq_session',
+    description: '[RFQ] Opens the RFQ quoter session (openRfqSession) and starts buffering incoming quote_request events for polling via list_pending_rfq_quote_requests. Idempotent — safe to call again if already open.',
+    inputSchema: { type: 'object', properties: {} }
   },
   {
-    name: 'submit_rfq_quote',
-    description: '[RFQ] Respond with a price quote.',
-    inputSchema: { type: 'object', properties: { requestId: { type: 'string' }, price: { type: 'number' }, size: { type: 'number' } }, required: ['requestId', 'price', 'size'] }
+    name: 'list_pending_rfq_quote_requests',
+    description: '[RFQ] Lists quote_request events received since the session opened that haven\'t been responded to or dropped yet. Call open_rfq_session first.',
+    inputSchema: { type: 'object', properties: {} }
   },
   {
-    name: 'get_rfq_quotes',
-    description: '[RFQ] Retrieve all quotes for a request.',
-    inputSchema: { type: 'object', properties: { requestId: { type: 'string' } }, required: ['requestId'] }
+    name: 'respond_to_rfq_quote_request',
+    description: '[RFQ] [Trading] Responds to a pending quote_request with a price (and optional size) via the stored event\'s quote() method. This commits you to trade if the taker selects your quote — moves real funds if filled.',
+    inputSchema: { type: 'object', properties: { requestId: { type: 'string' }, price: { type: 'number' }, size: { type: 'number' } }, required: ['requestId', 'price'] }
   },
   {
-    name: 'confirm_rfq_trade',
-    description: '[RFQ] Execute trade based on accepted quote.',
-    inputSchema: { type: 'object', properties: { requestId: { type: 'string' }, quoteId: { type: 'string' } }, required: ['requestId', 'quoteId'] }
+    name: 'cancel_rfq_quote',
+    description: '[RFQ] Requests cancellation of a previously submitted quote (cancelQuote). The ack means the backend processed the request, not that the quote was definitely withdrawn.',
+    inputSchema: { type: 'object', properties: { reference: { type: 'object', additionalProperties: true } }, required: ['reference'] }
+  },
+  {
+    name: 'close_rfq_session',
+    description: '[RFQ] Closes the RFQ quoter session stream.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+
+  // Perps trading — session-based (openPerpsSession). Every method Polymarket
+  // exposes here is marked @experimental: "may change in a breaking way in
+  // any release, including patch releases." Treat this surface as less
+  // stable than the rest of the MCP and re-verify after any SDK bump.
+  {
+    name: 'open_perps_session',
+    description: '[Perps] Opens and connects the Perps trading session (openPerpsSession + connect). Idempotent — reused across calls until closed. Required before any other perps session tool below. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'close_perps_session',
+    description: '[Perps] Closes the Perps trading session.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'fetch_perps_balances',
+    description: '[Perps] Session fetchBalances — current Perps balances for the authenticated account. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'fetch_perps_portfolio',
+    description: '[Perps] Session fetchPortfolio — current Perps portfolio for the authenticated account. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'fetch_perps_account_stats',
+    description: '[Perps] Session fetchStats — account-level Perps statistics. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'fetch_perps_account_config',
+    description: '[Perps] Session fetchAccountConfig — Perps account configuration, optionally filtered by instrument. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { instrumentId: { type: 'number' } } }
+  },
+  {
+    name: 'fetch_perps_open_orders',
+    description: '[Perps] Session fetchOpenOrders — currently open Perps orders, optionally filtered by instrument. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { instrumentId: { type: 'number' } } }
+  },
+  {
+    name: 'fetch_perps_orders',
+    description: '[Perps] Session fetchOrders — Perps orders (any status) for the authenticated account. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { instrumentId: { type: 'number' } } }
+  },
+  {
+    name: 'list_perps_fills',
+    description: '[Perps] Session listFills — Perps fills, paginated. Default limit 10, max 100. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { instrumentId: { type: 'number' }, limit: { type: 'number' }, offset: { type: 'number' } } }
+  },
+  {
+    name: 'list_perps_funding_payments',
+    description: '[Perps] Session listFundingPayments — Perps funding payments, paginated. Default limit 10, max 100. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { instrumentId: { type: 'number' }, limit: { type: 'number' }, offset: { type: 'number' } } }
+  },
+  {
+    name: 'list_perps_deposits',
+    description: '[Perps] Session listDeposits — Perps deposits, paginated. Default limit 10, max 100. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { limit: { type: 'number' }, offset: { type: 'number' } } }
+  },
+  {
+    name: 'list_perps_withdrawals',
+    description: '[Perps] Session listWithdrawals — Perps withdrawals, paginated. Default limit 10, max 100. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { limit: { type: 'number' }, offset: { type: 'number' } } }
+  },
+  {
+    name: 'list_perps_equity_history',
+    description: '[Perps] Session listEquityHistory — account equity over time, paginated. Default limit 10, max 100. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { limit: { type: 'number' }, offset: { type: 'number' } } }
+  },
+  {
+    name: 'list_perps_pnl_history',
+    description: '[Perps] Session listPnlHistory — realized/unrealized PnL over time, paginated. Default limit 10, max 100. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { limit: { type: 'number' }, offset: { type: 'number' } } }
+  },
+  {
+    name: 'place_perps_order',
+    description: '[Perps] [Trading] Session placeOrder — places one leveraged Perps order (optionally with stop-loss/take-profit) and waits for the first matching order update. Requires open_perps_session first. Blocked by guardrails until enabled — see update_strategy. @experimental SDK surface.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instrumentId: { type: 'number' },
+        side: { type: 'string', enum: ['BUY', 'SELL'] },
+        price: { type: 'number', description: 'Omit for market-style execution on IOC/FOK.' },
+        quantity: { type: 'number' },
+        timeInForce: { type: 'string', enum: ['GTC', 'IOC', 'FOK'] },
+        postOnly: { type: 'boolean' },
+        reduceOnly: { type: 'boolean' },
+        clientOrderId: { type: 'string' },
+        stopLoss: { type: 'object', properties: { triggerPrice: { type: 'number' }, limitPrice: { type: 'number' } } },
+        takeProfit: { type: 'object', properties: { triggerPrice: { type: 'number' }, limitPrice: { type: 'number' } } },
+      },
+      required: ['instrumentId', 'side', 'quantity', 'timeInForce']
+    }
+  },
+  {
+    name: 'post_perps_orders',
+    description: '[Perps] [Trading] Session postOrders — low-level batch order post, returns queue-entry acknowledgements only (prefer place_perps_order unless you specifically need this). Blocked by guardrails until enabled. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { orders: { type: 'array', items: { type: 'object', additionalProperties: true } }, expiresAt: { type: 'number' } }, required: ['orders'] }
+  },
+  {
+    name: 'place_perps_position_tp_sl',
+    description: '[Perps] [Trading] Session placePositionTpSl — attaches take-profit/stop-loss protection to your current position for an instrument (exit side inferred automatically). Blocked by guardrails until enabled. @experimental SDK surface.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instrumentId: { type: 'number' },
+        stopLoss: { type: 'object', properties: { triggerPrice: { type: 'number' } } },
+        takeProfit: { type: 'object', properties: { triggerPrice: { type: 'number' } } },
+      },
+      required: ['instrumentId']
+    }
+  },
+  {
+    name: 'cancel_perps_order',
+    description: '[Perps] Session cancelOrder — cancels one Perps order. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { orderId: { type: 'string' } }, required: ['orderId'] }
+  },
+  {
+    name: 'cancel_perps_orders',
+    description: '[Perps] Session cancelOrders — cancels multiple Perps orders. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { orderIds: { type: 'array', items: { type: 'string' } } }, required: ['orderIds'] }
+  },
+  {
+    name: 'cancel_all_perps_orders',
+    description: '[Perps] Session cancelAllOrders — cancels all open Perps orders, optionally scoped to one instrument. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { instrumentId: { type: 'number' } } }
+  },
+  {
+    name: 'update_perps_leverage',
+    description: '[Perps] [Trading] Session updateLeverage — changes leverage and margin mode for an instrument. Changes risk exposure on open/future positions — blocked by guardrails until enabled. @experimental SDK surface.',
+    inputSchema: { type: 'object', properties: { instrumentId: { type: 'number' }, leverage: { type: 'number' }, crossMargin: { type: 'boolean' } }, required: ['instrumentId', 'leverage'] }
   },
   // On-chain CTF inventory (split/merge/redeem + prepares)
   {
@@ -2190,7 +2399,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   const toolResult = await (async () => {
   try {
-  const gapResult = await handleGapTool(name, args, { getPub: getPublicClient, getSec });
+  const gapResult = await handleGapTool(name, args, { getPub: getPublicClient, getSec, stateGuard: stateGuardOrThrough });
   if (gapResult) return gapResult;
   switch (name) {
     // === Category-based discovery tools (for fast agent tool discovery) ===
@@ -2262,6 +2471,92 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'prepare_split_position': { const s=await getSec(); const r = await (s as any).prepareSplitPosition?.(args) ?? { prepared: true, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Prepared Split Tx': r }, 'Prepare Split Position') }] }; }
     case 'prepare_merge_positions': { const s=await getSec(); const r = await (s as any).prepareMergePositions?.(args) ?? { prepared: true, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Prepared Merge Tx': r }, 'Prepare Merge Positions') }] }; }
     case 'prepare_redeem_positions': { const s=await getSec(); const r = await (s as any).prepareRedeemPositions?.(args) ?? { prepared: true, ...args }; return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Prepared Redeem Tx': r }, 'Prepare Redeem Positions') }] }; }
+
+    // === RFQ (quoter/market-maker side only — see tool descriptions) ===
+    case 'open_rfq_session': {
+      await getRfqSession();
+      return { content: [{ type: 'text' as const, text: F.toHumanReadable({ Status: 'RFQ quoter session open, buffering incoming quote_request events.' }, 'Open RFQ Session') }] };
+    }
+    case 'list_pending_rfq_quote_requests': {
+      const pending = [...rfqPendingQuoteRequests.entries()].map(([id, ev]) => ({ requestId: id, tokenId: (ev as any)?.tokenId, side: (ev as any)?.side, size: (ev as any)?.size, receivedAt: (ev as any)?.timestamp }));
+      return { content: [{ type: 'text' as const, text: F.toHumanReadable({ Pending: pending, Count: pending.length }, 'Pending RFQ Quote Requests') }] };
+    }
+    case 'respond_to_rfq_quote_request': {
+      const guardRfq1 = stateGuardOrThrough();
+      if (guardRfq1) return guardRfq1;
+      const requestId = String((args as any)?.requestId ?? '');
+      const event = rfqPendingQuoteRequests.get(requestId);
+      if (!event || typeof event.quote !== 'function') {
+        return { isError: true, content: [{ type: 'text' as const, text: `No pending quote_request with id ${requestId}. Call list_pending_rfq_quote_requests first.` }] };
+      }
+      const ref = await event.quote({ price: (args as any)?.price, size: (args as any)?.size });
+      rfqPendingQuoteRequests.delete(requestId);
+      return { content: [{ type: 'text' as const, text: F.toHumanReadable({ 'Quote Reference': ref }, 'Respond To RFQ Quote Request') }] };
+    }
+    case 'cancel_rfq_quote': {
+      const guardRfq2 = stateGuardOrThrough();
+      if (guardRfq2) return guardRfq2;
+      const session = await getRfqSession();
+      const ack = await session.cancelQuote((args as any)?.reference);
+      return { content: [{ type: 'text' as const, text: F.toHumanReadable({ Ack: ack }, 'Cancel RFQ Quote') }] };
+    }
+    case 'close_rfq_session': {
+      await closeRfqSession();
+      return { content: [{ type: 'text' as const, text: F.toHumanReadable({ Status: 'RFQ quoter session closed.' }, 'Close RFQ Session') }] };
+    }
+
+    // === Perps (session-based; every method here is @experimental per Polymarket) ===
+    case 'open_perps_session': {
+      await getPerpsSession();
+      return { content: [{ type: 'text' as const, text: F.toHumanReadable({ Status: 'Perps session open and connected.' }, 'Open Perps Session') }] };
+    }
+    case 'close_perps_session': {
+      await closePerpsSession();
+      return { content: [{ type: 'text' as const, text: F.toHumanReadable({ Status: 'Perps session closed.' }, 'Close Perps Session') }] };
+    }
+    case 'fetch_perps_balances': return callWithFormat(async () => (await getPerpsSession()).fetchBalances(), F.formatGeneric, name);
+    case 'fetch_perps_portfolio': return callWithFormat(async () => (await getPerpsSession()).fetchPortfolio(), F.formatGeneric, name);
+    case 'fetch_perps_account_stats': return callWithFormat(async () => (await getPerpsSession()).fetchStats(), F.formatGeneric, name);
+    case 'fetch_perps_account_config': return callWithFormat(async () => (await getPerpsSession()).fetchAccountConfig(args), F.formatGeneric, name);
+    case 'fetch_perps_open_orders': return callWithFormat(async () => (await getPerpsSession()).fetchOpenOrders(args), F.formatGeneric, name);
+    case 'fetch_perps_orders': return callWithFormat(async () => (await getPerpsSession()).fetchOrders(args), F.formatGeneric, name);
+    case 'list_perps_fills': { const lim = sanitizePageSize(args); const off = Number((args as any)?.offset ?? 0) || 0; return callPaginatedWithFormat((await getPerpsSession()).listFills({ ...(args||{}), pageSize: lim }), F.formatGeneric, name, lim, off); }
+    case 'list_perps_funding_payments': { const lim = sanitizePageSize(args); const off = Number((args as any)?.offset ?? 0) || 0; return callPaginatedWithFormat((await getPerpsSession()).listFundingPayments({ ...(args||{}), pageSize: lim }), F.formatGeneric, name, lim, off); }
+    case 'list_perps_deposits': { const lim = sanitizePageSize(args); const off = Number((args as any)?.offset ?? 0) || 0; return callPaginatedWithFormat((await getPerpsSession()).listDeposits({ ...(args||{}), pageSize: lim }), F.formatGeneric, name, lim, off); }
+    case 'list_perps_withdrawals': { const lim = sanitizePageSize(args); const off = Number((args as any)?.offset ?? 0) || 0; return callPaginatedWithFormat((await getPerpsSession()).listWithdrawals({ ...(args||{}), pageSize: lim }), F.formatGeneric, name, lim, off); }
+    case 'list_perps_equity_history': { const lim = sanitizePageSize(args); const off = Number((args as any)?.offset ?? 0) || 0; return callPaginatedWithFormat((await getPerpsSession()).listEquityHistory({ ...(args||{}), pageSize: lim }), F.formatGeneric, name, lim, off); }
+    case 'list_perps_pnl_history': { const lim = sanitizePageSize(args); const off = Number((args as any)?.offset ?? 0) || 0; return callPaginatedWithFormat((await getPerpsSession()).listPnlHistory({ ...(args||{}), pageSize: lim }), F.formatGeneric, name, lim, off); }
+    case 'place_perps_order': {
+      const guardPerps1 = guardBlockOrThrough({
+        tokenId: String((args as any)?.instrumentId ?? ''),
+        price: Number((args as any)?.price ?? 0),
+        size: Number((args as any)?.quantity ?? 0),
+        side: String((args as any)?.side ?? ''),
+      });
+      if (guardPerps1) return guardPerps1;
+      const { stopLoss, takeProfit, ...orderArgs } = (args as any) || {};
+      const request = (stopLoss || takeProfit) ? { ...orderArgs, stopLoss, takeProfit } : orderArgs;
+      return callWithFormat(async () => (await getPerpsSession()).placeOrder(request), F.formatGeneric, name);
+    }
+    case 'post_perps_orders': {
+      const guardPerps2 = stateGuardOrThrough();
+      if (guardPerps2) return guardPerps2;
+      return callWithFormat(async () => (await getPerpsSession()).postOrders(args), F.formatGeneric, name);
+    }
+    case 'place_perps_position_tp_sl': {
+      const guardPerps3 = stateGuardOrThrough();
+      if (guardPerps3) return guardPerps3;
+      return callWithFormat(async () => (await getPerpsSession()).placePositionTpSl(args), F.formatGeneric, name);
+    }
+    case 'cancel_perps_order': return callWithFormat(async () => (await getPerpsSession()).cancelOrder(args), F.formatGeneric, name);
+    case 'cancel_perps_orders': return callWithFormat(async () => (await getPerpsSession()).cancelOrders(args), F.formatGeneric, name);
+    case 'cancel_all_perps_orders': return callWithFormat(async () => (await getPerpsSession()).cancelAllOrders(args), F.formatGeneric, name);
+    case 'update_perps_leverage': {
+      const guardPerps4 = stateGuardOrThrough();
+      if (guardPerps4) return guardPerps4;
+      return callWithFormat(async () => (await getPerpsSession()).updateLeverage(args), F.formatGeneric, name);
+    }
+
     case 'generate_builder_headers': {
       try { const { generateBuilderHeaders } = await import('@polymarket/client/actions'); const h = await generateBuilderHeaders(args as any); return {content:[{type:'text',text:JSON.stringify({success:true,headers:h})}]}; } catch(e:any){ return {content:[{type:'text',text:JSON.stringify({success:false,error:String(e)})}]}; }
     }
@@ -4313,6 +4608,12 @@ async function main() {
   const shutdown = async () => {
     try {
       await resourceManager.closeAll();
+    } catch {}
+    try {
+      await closePerpsSession();
+    } catch {}
+    try {
+      await closeRfqSession();
     } catch {}
     process.exit(0);
   };

@@ -22,6 +22,15 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: bo
 interface GapToolContext {
   getPub: () => any;
   getSec: () => Promise<any>;
+  /**
+   * Guardrails check for on-chain/fund-moving actions (deposit/withdraw perps,
+   * combo/market split-merge, revoke perps credentials). Same readOnly-by-
+   * default gate as the main dispatcher's order/state-changing tools — passed
+   * in rather than imported directly so this module doesn't need to reach
+   * into mcp.ts's module-level strategyStore. Returns a ToolResult to return
+   * immediately if blocked, or null if clear to proceed.
+   */
+  stateGuard: () => ToolResult | null;
 }
 
 function ok(payload: unknown, title: string): ToolResult {
@@ -126,10 +135,14 @@ export async function handleGapTool(name: string, args: any, ctx: GapToolContext
       }
 
       case 'deposit_to_perps': {
+        const guard = ctx.stateGuard();
+        if (guard) return guard;
         const sec = await ctx.getSec();
         return ok(await actions.depositToPerps(sec, args), 'Perps Deposit');
       }
       case 'withdraw_from_perps': {
+        const guard = ctx.stateGuard();
+        if (guard) return guard;
         const sec = await ctx.getSec();
         return ok(await actions.withdrawFromPerps(sec, args), 'Perps Withdrawal');
       }
@@ -138,6 +151,8 @@ export async function handleGapTool(name: string, args: any, ctx: GapToolContext
         return ok(await actions.preparePerpsDeposit(sec, args), 'Prepared Perps Deposit');
       }
       case 'revoke_perps_credentials': {
+        const guard = ctx.stateGuard();
+        if (guard) return guard;
         const sec = await ctx.getSec();
         await actions.revokePerpsCredentials(sec, args);
         return ok({ success: true }, 'Perps Credentials Revoked');
@@ -153,6 +168,8 @@ export async function handleGapTool(name: string, args: any, ctx: GapToolContext
         return ok(await paginatedFirstPage(Promise.resolve(actions.listComboPositions(sec, { ...args, pageSize: limit })), limit, offset), 'Combo Positions');
       }
       case 'merge_combo_position': {
+        const guard = ctx.stateGuard();
+        if (guard) return guard;
         const sec = await ctx.getSec();
         return ok(await actions.mergeComboPosition(sec, args), 'Combo Merge Result');
       }
@@ -161,6 +178,8 @@ export async function handleGapTool(name: string, args: any, ctx: GapToolContext
         return ok(await actions.prepareMergeComboPosition(sec, args), 'Prepared Combo Merge');
       }
       case 'split_combo_position': {
+        const guard = ctx.stateGuard();
+        if (guard) return guard;
         const sec = await ctx.getSec();
         return ok(await actions.splitComboPosition(sec, args), 'Combo Split Result');
       }
@@ -174,6 +193,8 @@ export async function handleGapTool(name: string, args: any, ctx: GapToolContext
       }
 
       case 'merge_market_position': {
+        const guard = ctx.stateGuard();
+        if (guard) return guard;
         const sec = await ctx.getSec();
         return ok(await actions.mergeMarketPosition(sec, args), 'Market Merge Result');
       }
@@ -182,6 +203,8 @@ export async function handleGapTool(name: string, args: any, ctx: GapToolContext
         return ok(await actions.prepareMergeMarketPosition(sec, args), 'Prepared Market Merge');
       }
       case 'split_market_position': {
+        const guard = ctx.stateGuard();
+        if (guard) return guard;
         const sec = await ctx.getSec();
         return ok(await actions.splitMarketPosition(sec, args), 'Market Split Result');
       }
