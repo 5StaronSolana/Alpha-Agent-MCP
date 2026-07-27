@@ -22,14 +22,24 @@ same three pieces into its native schema:
   doc). Omit auth vars entirely to run read-only/discovery tools with zero
   config.
 
-**This package is not published to npm.** There is no `npx alpha-agent-mcp`
-today — the `alpha-agent-mcp` bin in `package.json` (pointing at
-`dist/mcp.js`) exists for whenever it is published, but until then every
-host must be pointed at a local clone via `command`/`args`/`cwd` as above,
-not a package name. Any Claude Code, Grok-built, or other MCP-spec-compliant
-agent works identically once pointed at the built `dist/mcp.js` — the
-protocol layer (handshake, `tools/list`, `tools/call`) is host-agnostic by
-construction; nothing in this server is Claude-specific.
+**This package is not published to the npm registry** — a bare
+`npx alpha-agent-mcp` won't work (npm would try to resolve that as a
+registry package name and fail). It *is* runnable via `npx` today using a
+git specifier, which is what the main README's one-command setup uses and
+what this repo's own test suite exercises end-to-end:
+
+```bash
+npx -y -p github:5StaronSolana/Alpha-Agent-MCP alpha-agent-mcp
+```
+
+`npx` clones the repo, runs `npm install` (which builds via the `prepare`
+script), and starts `dist/mcp.js` over stdio — no local clone required. The
+local-clone + `command`/`args`/`cwd` config above is still the right choice
+when you want to read or modify the code, or pin to a specific commit
+instead of always pulling `main`. Any Claude Code, Grok-built, or other
+MCP-spec-compliant agent works identically either way — the protocol layer
+(handshake, `tools/list`, `tools/call`) is host-agnostic by construction;
+nothing in this server is Claude-specific.
 
 ## First run
 
