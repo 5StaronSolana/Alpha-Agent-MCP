@@ -73,6 +73,23 @@ export function categoryFor(method: string): string {
   return 'other';
 }
 
+/**
+ * True for the ~19 SDK `prepare*` methods (prepareLimitOrder, prepareErc20Approval,
+ * prepareSplitPosition, ...) that resolve to an AsyncGenerator-based signing workflow
+ * instead of a plain result — the caller is meant to drive it step-by-step, exchanging
+ * signatures across multiple turns. This one-shot dispatcher has no way to do that:
+ * detected generically (not by name list, so it can't drift as the SDK adds more of
+ * these) rather than assuming which methods return one.
+ */
+function isDrivableWorkflow(value: unknown): boolean {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as any)[Symbol.asyncIterator] === 'function' &&
+    typeof (value as any).next === 'function'
+  );
+}
+
 /** Calls a method on the client by name. Handles both Promise-returning and Paginated-returning SDK methods. */
 export async function callMethod(client: any, method: string, params: unknown): Promise<unknown> {
   const fn = client[method];
@@ -85,7 +102,16 @@ export async function callMethod(client: any, method: string, params: unknown): 
     const page = await result.firstPage();
     return trim(page);
   }
-  return trim(await result);
+  const resolved = await result;
+  if (isDrivableWorkflow(resolved)) {
+    throw new Error(
+      `"${method}" returned a multi-step signing workflow (an AsyncGenerator), which this dispatcher can't drive — ` +
+        `calling it does nothing (no signature exchanged, nothing submitted). Use the direct one-shot equivalent ` +
+        `instead: placeLimitOrder/placeMarketOrder/postOrder(s) for orders, or the corresponding non-"prepare*" ` +
+        `method for approvals/transfers/splits/merges/redemptions/perps-deposit.`
+    );
+  }
+  return trim(resolved);
 }
 
 const MAX_ARRAY_ITEMS = 50;
