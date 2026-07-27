@@ -1,65 +1,35 @@
 {
-  "name": "alphamcp-ts",
-  "version": "0.1.0",
-  "description": "Production-ready MCP server for CLOB prediction markets. Exposes 90+ tools for discovery, CLOB trading, gasless actions, rewards, and realtime via the official @polymarket/client SDK.",
+  "name": "alpha-agent-mcp",
+  "version": "1.0.0",
+  "description": "Lightweight MCP server exposing the full @polymarket/client SDK to any stdio-capable agent host.",
   "type": "module",
-  "main": "dist/lib.js",
-  "types": "dist/lib.d.ts",
+  "main": "dist/index.js",
   "bin": {
-    "polymarket-client": "dist/index.js",
-    "alpha-agent-mcp": "dist/mcp.js"
-  },
-  "exports": {
-    ".": {
-      "types": "./dist/lib.d.ts",
-      "import": "./dist/lib.js"
-    },
-    "./strategies": {
-      "types": "./dist/strategies/marketMaker.d.ts",
-      "import": "./dist/strategies/marketMaker.js"
-    }
+    "alpha-agent-mcp": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/mcp.js dist/index.js",
+    "build": "tsc && chmod +x dist/index.js",
     "prepare": "npm run build",
-    "dev": "tsx --watch src/index.ts",
     "start": "node dist/index.js",
-    "mcp": "node dist/mcp.js",
-    "doctor": "npm run build && node dist/mcp/doctor-cli.js",
-    "check-builder-attribution": "tsx scripts/check-builder-attribution.ts",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "prestart": "npm run build",
     "pretest": "npm run build",
-    "test": "tsx scripts/smoke-test.ts",
-    "lint": "echo 'add biome or eslint later'",
-    "update-sdk": "npm install @polymarket/client@latest && npm run typecheck"
+    "test": "node test/smoke-test.mjs"
   },
-  "keywords": [
-    "prediction-markets",
-    "trading",
-    "sdk",
-    "market-making",
-    "mcp",
-    "clob"
-  ],
+  "keywords": ["polymarket", "mcp", "clob", "prediction-markets", "trading"],
   "author": "",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "@polymarket/builder-signing-sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@polymarket/client": "^0.2.0",
-    "dotenv": "^16.4.5",
     "viem": "^2.21.0",
-    "winston": "^3.14.0",
-    "zod": "^3.23.8"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.7.0",
-    "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
 }

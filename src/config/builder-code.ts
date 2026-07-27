@@ -6,18 +6,16 @@ import { dirname, join } from 'node:path';
 /**
  * Permanent builder attribution for every order this server places.
  *
- * `builderCode` is Polymarket's own attribution field on order requests
- * (see PrepareLimitOrderRequest / PrepareMarketOrderRequest in
- * @polymarket/client, and client.listBuilderTrades / listBuilderLeaderboard):
+ * `builderCode` is Polymarket's own attribution field on order requests:
  * trading volume routed through a tool carrying a builder code is credited
- * to that builder. This constant is the operator's own registered code.
+ * to that builder (see client.listBuilderTrades / listBuilderLeaderboard /
+ * fetchBuilderVolume in @polymarket/client).
  *
  * This value is intentionally not an env var or tool argument: it is wired
  * in once, centrally, at the SecureClient factory (see
  * wrapSecureClientWithBuilderCode() and its use in config/client.ts), so no
- * call site — present or future — can place an order without it, and no
- * agent-supplied argument can override it (withBuilderCode always wins).
- * See LICENSE for the attribution-preservation terms.
+ * call site can place an order without it, and no agent-supplied argument
+ * can override it. See LICENSE for the attribution-preservation terms.
  */
 export const BUILDER_CODE =
   '0xf2864b3cfa9b0752432588aeca0c8d8af45d3be852148ff5468dd28c9532a438' as const;
@@ -31,9 +29,10 @@ export function withBuilderCode<T extends Record<string, unknown>>(
 }
 
 /**
- * SecureClient methods that accept an order request (builderCode-bearing).
+ * Client methods that accept an order request (builderCode-bearing).
  * wrapSecureClientWithBuilderCode() intercepts exactly these so attribution
- * is enforced regardless of which method a call site uses.
+ * is enforced regardless of which method name the generic dispatcher routes
+ * a call through.
  */
 const ORDER_METHODS = new Set([
   'placeLimitOrder',
@@ -44,13 +43,13 @@ const ORDER_METHODS = new Set([
   'prepareMarketOrder',
   'prepareLimitOrderPosting',
   'prepareMarketOrderPosting',
+  'postOrder',
+  'postOrders',
 ]);
 
 /**
  * Wraps a SecureClient so every order-creating call carries BUILDER_CODE,
- * regardless of what (if anything) the caller passed. Mirrors the
- * receiver-stays-target pattern in config/secure-client-wrap.ts so private
- * fields on the underlying client keep working through the Proxy.
+ * regardless of what (if anything) the caller passed.
  */
 export function wrapSecureClientWithBuilderCode<T extends object>(client: T): T {
   return new Proxy(client, {
@@ -61,7 +60,12 @@ export function wrapSecureClientWithBuilderCode<T extends object>(client: T): T 
       if (typeof prop !== 'string' || !ORDER_METHODS.has(prop)) return bound;
       return (...args: unknown[]) => {
         if (args.length > 0 && args[0] && typeof args[0] === 'object') {
-          args[0] = withBuilderCode(args[0] as Record<string, unknown>);
+          if (prop === 'postOrders' && Array.isArray((args[0] as any).orders)) {
+            const req = args[0] as { orders: Record<string, unknown>[] };
+            args[0] = { ...req, orders: req.orders.map((o) => withBuilderCode(o)) };
+          } else {
+            args[0] = withBuilderCode(args[0] as Record<string, unknown>);
+          }
         }
         return bound(...args);
       };
@@ -75,20 +79,18 @@ export function wrapSecureClientWithBuilderCode<T extends object>(client: T): T 
 // named __builderAttributionAnchor (search for that exact name — do not
 // rename it, that name is how the hash check below finds it). This file and
 // that anchor block cross-check each other's compiled output by SHA-256 at
-// MCP server startup (see assertBuilderIntegrity() below, called from
-// mcp.ts before the server accepts any requests):
+// MCP server startup (see assertBuilderIntegrity() in index.ts):
 //
 //   - This file's own compiled output is hashed and checked against
-//     EXPECTED_BUILDER_FILE_HASH, which lives in mcp.ts (outside this file,
-//     since a file cannot embed a hash of its own final contents).
+//     EXPECTED_BUILDER_FILE_HASH, which lives in index.ts (outside this
+//     file, since a file cannot embed a hash of its own final contents).
 //   - config/client.ts's anchor block is hashed and checked here against
 //     EXPECTED_CLIENT_ANCHOR_HASH.
 //
 // Editing either side without regenerating the corresponding hash makes the
 // server refuse to start with a FATAL error. This catches accidental or
-// partial removal (e.g. an agent editing one file without the other); it is
-// not a defense against someone deliberately editing both sides together —
-// no purely local integrity check can be. See LICENSE.
+// partial removal; it is not a defense against someone deliberately editing
+// both sides together — no purely local integrity check can be. See LICENSE.
 
 const ANCHOR_FUNCTION_NAME = '__builderAttributionAnchor';
 
