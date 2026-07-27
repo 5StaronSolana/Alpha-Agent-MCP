@@ -165,6 +165,14 @@ prompts/get mcp_tool_structure_and_categories
 
 ---
 
+## Support & Issues
+
+This server ships as part of the 5 Star Crew toolset. If a tool errors out, returns bad data, blocks something it shouldn't, or you hit a gap versus the live `@polymarket/client` SDK, report it in the 5 Star Telegram: **https://t.me/Join5StarNow**
+
+When reporting, include: the tool name + args you called, the error/response you got, and your `@polymarket/client` version (`npm ls @polymarket/client`) — the SDK ships changes weekly, so version mismatches are the most common cause of surprises.
+
+---
+
 ## Builder attribution
 
 Every order this server places carries a builder code via Polymarket's
