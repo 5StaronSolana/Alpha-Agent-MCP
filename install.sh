@@ -19,13 +19,13 @@ INSTALL_DIR="${ALPHA_AGENT_MCP_DIR:-$HOME/.alpha-agent-mcp}"
 echo "==> Alpha-Agent-MCP installer"
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "error: node is required (>=22). Install Node.js first: https://nodejs.org" >&2
+  echo "error: node is required (>=24). Install Node.js first: https://nodejs.org" >&2
   exit 1
 fi
 
 NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])')"
-if [ "$NODE_MAJOR" -lt 22 ]; then
-  echo "error: Node >=22 required, found $(node -v)" >&2
+if [ "$NODE_MAJOR" -lt 24 ]; then
+  echo "error: Node >=24 required, found $(node -v)" >&2
   exit 1
 fi
 
