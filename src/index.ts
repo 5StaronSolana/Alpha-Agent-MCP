@@ -10,7 +10,7 @@ import { z } from 'zod';
 
 import { verifyClientAnchor, BUILDER_CODE } from './config/builder-code.js';
 import { getActiveClient, getPublicClient, hasCredentials } from './config/client.js';
-import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, trim } from './registry.js';
+import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, trim, CATEGORIES, FUND_MOVING_METHODS } from './registry.js';
 import { checkGuardrails, getGuardrails, setGuardrails } from './guardrails.js';
 import { getGuide, refreshGuide } from './docs.js';
 import { FEED_DEFS, ensureAndRead, closeAllFeeds } from './live-feeds.js';
@@ -59,27 +59,41 @@ server.registerTool(
     title: 'List Polymarket methods',
     description: 'List/filter callable Polymarket SDK methods (see github.com/Polymarket/ts-sdk for full reference)',
     inputSchema: {
-      category: z.string().optional().describe('trading|markets|account|rewards|perps|rfq|onchain|realtime|other'),
-      query: z.string().optional().describe('substring match on method name'),
+      category: z.enum(CATEGORIES).optional().describe('Restrict to one method category.'),
+      query: z.string().optional().describe('Substring match on method name (case-insensitive).'),
+      limit: z.number().int().min(1).max(100).default(20).describe('Max methods returned. Raise it or narrow category/query to see more.'),
     },
-    annotations: { readOnlyHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
-  async ({ category, query }) => {
+  async ({ category, query, limit }) => {
     const client = await getActiveClient();
     let names = listMethodNames(client);
     if (category) names = names.filter((n) => categoryFor(n) === category);
     if (query) names = names.filter((n) => n.toLowerCase().includes(query.toLowerCase()));
     const authenticated = hasCredentials();
-    const out = names.map((name) => ({
+    const totalMatched = names.length;
+    const out = names.slice(0, limit).map((name) => ({
       method: name,
       category: categoryFor(name),
       fundMoving: isFundMoving(name),
     }));
+    const hiddenFundMovingCount = authenticated
+      ? 0
+      : [...FUND_MOVING_METHODS].filter((m) => !names.includes(m)).length;
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify({ authenticated, count: out.length, methods: out }),
+          text: JSON.stringify({
+            authenticated,
+            count: out.length,
+            totalMatched,
+            ...(totalMatched > out.length ? { truncated: `Showing ${out.length} of ${totalMatched}. Narrow category/query or raise limit.` } : {}),
+            ...(hiddenFundMovingCount > 0
+              ? { note: `${hiddenFundMovingCount} fund-moving method(s) (trading/onchain/rfq) are hidden — set PRIVATE_KEY to authenticate and reveal them.` }
+              : {}),
+            methods: out,
+          }),
         },
       ],
     };
@@ -97,7 +111,7 @@ server.registerTool(
       method: z.string().describe('exact read-only method name from poly_methods'),
       params: z.record(z.string(), z.unknown()).optional().describe('request object for this method'),
     },
-    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   async ({ method, params }) => {
     if (isFundMoving(method)) {
@@ -174,7 +188,7 @@ server.registerTool(
   {
     title: 'Show safety guardrails',
     description: 'Show current fund-moving safety guardrails',
-    annotations: { readOnlyHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   async () => ({ content: [{ type: 'text', text: JSON.stringify(getGuardrails()) }] })
 );
@@ -202,7 +216,7 @@ server.registerTool(
   {
     title: 'Refresh Polymarket guide',
     description: 'Force refetch the live Polymarket agent guide (docs.polymarket.com/llms.txt)',
-    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   async () => {
     const { text } = await refreshGuide();

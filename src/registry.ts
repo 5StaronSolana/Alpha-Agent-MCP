@@ -63,6 +63,9 @@ const CATEGORY_PATTERNS: Array<[string, RegExp]> = [
   ['realtime', /^subscribe/i],
 ];
 
+/** Derived from CATEGORY_PATTERNS (+ "other") so the poly_methods schema enum can't drift from the classifier. */
+export const CATEGORIES = [...CATEGORY_PATTERNS.map(([cat]) => cat), 'other'] as const;
+
 export function categoryFor(method: string): string {
   for (const [cat, re] of CATEGORY_PATTERNS) {
     if (re.test(method)) return cat;
@@ -87,12 +90,46 @@ export async function callMethod(client: any, method: string, params: unknown): 
 
 const MAX_ARRAY_ITEMS = 50;
 const MAX_STRING_LEN = 2000;
+const DEDUPE_MIN_LEN = 200;
+const DEDUPE_MIN_REPEATS = 3;
+
+/**
+ * Polymarket events repeat the same long boilerplate (e.g. resolution `description`)
+ * verbatim across every sibling market. Each copy passes the per-string MAX_STRING_LEN
+ * check individually, so 10-15 near-identical copies still balloon the response —
+ * this is what blows past token limits on fetchEvent/search. Collapse repeats in place.
+ */
+function dedupeSiblingStrings(items: unknown[]): unknown[] {
+  if (items.length < DEDUPE_MIN_REPEATS || !items.every((v) => v && typeof v === 'object' && !Array.isArray(v))) {
+    return items;
+  }
+  const firstValueByKey = new Map<string, string>();
+  const repeatCountByKey = new Map<string, number>();
+  for (const item of items as Record<string, unknown>[]) {
+    for (const [k, v] of Object.entries(item)) {
+      if (typeof v !== 'string' || v.length < DEDUPE_MIN_LEN) continue;
+      if (!firstValueByKey.has(k)) firstValueByKey.set(k, v);
+      if (firstValueByKey.get(k) === v) repeatCountByKey.set(k, (repeatCountByKey.get(k) ?? 0) + 1);
+    }
+  }
+  const dedupeKeys = [...repeatCountByKey.entries()].filter(([, c]) => c >= DEDUPE_MIN_REPEATS).map(([k]) => k);
+  if (dedupeKeys.length === 0) return items;
+  return (items as Record<string, unknown>[]).map((item, i) => {
+    if (i === 0) return item;
+    const out = { ...item };
+    for (const k of dedupeKeys) {
+      if (out[k] === firstValueByKey.get(k)) out[k] = `(same as item[0].${k})`;
+    }
+    return out;
+  });
+}
 
 /** Trims oversized responses so agents get compact, cheap-to-read JSON. */
 export function trim(value: unknown, depth = 0): unknown {
   if (depth > 6) return value;
   if (Array.isArray(value)) {
-    const sliced = value.slice(0, MAX_ARRAY_ITEMS).map((v) => trim(v, depth + 1));
+    const deduped = dedupeSiblingStrings(value);
+    const sliced = deduped.slice(0, MAX_ARRAY_ITEMS).map((v) => trim(v, depth + 1));
     return value.length > MAX_ARRAY_ITEMS ? [...sliced, `…${value.length - MAX_ARRAY_ITEMS} more items truncated`] : sliced;
   }
   if (typeof value === 'string') {
