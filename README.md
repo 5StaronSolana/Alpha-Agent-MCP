@@ -7,6 +7,8 @@ per-method hand-written tools: every SDK method is reachable generically.
 
 ## Setup
 
+Requires Node >=24 (matches `@polymarket/client`'s own engine requirement).
+
 ```bash
 git clone https://github.com/5StaronSolana/Alpha-Agent-MCP.git
 cd Alpha-Agent-MCP
