@@ -46,10 +46,10 @@ function persist(): void {
 }
 
 function sanitize(raw: unknown): Guardrails {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { readOnly: false };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { readOnly: true };
   const g = raw as Partial<Guardrails>;
   return {
-    readOnly: typeof g.readOnly === 'boolean' ? g.readOnly : false,
+    readOnly: typeof g.readOnly === 'boolean' ? g.readOnly : true,
     maxOrderSizeUsd: typeof g.maxOrderSizeUsd === 'number' && g.maxOrderSizeUsd > 0 ? g.maxOrderSizeUsd : undefined,
     maxPriceDeviationFromMid:
       typeof g.maxPriceDeviationFromMid === 'number' && g.maxPriceDeviationFromMid > 0 ? g.maxPriceDeviationFromMid : undefined,

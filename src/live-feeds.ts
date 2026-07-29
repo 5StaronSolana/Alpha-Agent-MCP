@@ -75,7 +75,11 @@ export function isLiveFeedUri(uri: string): boolean {
 
 type FeedState = { latest: unknown[]; closing: boolean; close?: () => Promise<void> };
 
-const feeds = new Map<string, FeedState>();
+// Keyed by in-flight/resolved start promise (not the resolved FeedState) so a
+// synchronous check-then-set around the one `await` boundary in
+// ensureAndRead can't interleave — two concurrent reads of the same URI must
+// share one subscription, not open two.
+const feeds = new Map<string, Promise<FeedState>>();
 const MAX_BUFFERED_EVENTS = 20;
 
 async function startFeed(def: FeedDef, vars: Vars, onUpdate: () => void): Promise<FeedState> {
@@ -104,18 +108,23 @@ async function startFeed(def: FeedDef, vars: Vars, onUpdate: () => void): Promis
 export async function ensureAndRead(uri: string, onUpdate: () => void): Promise<unknown[]> {
   const matched = matchFeed(uri);
   if (!matched) throw new Error(`Not a live-feed URI: ${uri}`);
-  let state = feeds.get(uri);
-  if (!state) {
-    state = await startFeed(matched.def, matched.vars, onUpdate);
-    feeds.set(uri, state);
+  let statePromise = feeds.get(uri);
+  if (!statePromise) {
+    statePromise = startFeed(matched.def, matched.vars, onUpdate);
+    feeds.set(uri, statePromise);
+    // Don't leave a failed start cached — the next read should retry, not
+    // keep replaying the same rejection forever.
+    statePromise.catch(() => feeds.delete(uri));
   }
+  const state = await statePromise;
   return state.latest;
 }
 
 export async function closeAllFeeds(): Promise<void> {
-  for (const state of feeds.values()) {
-    state.closing = true;
+  for (const statePromise of feeds.values()) {
     try {
+      const state = await statePromise;
+      state.closing = true;
       await state.close?.();
     } catch {
       /* best-effort */
