@@ -48,6 +48,13 @@ Both env vars are optional — omit them entirely to run read-only/discovery
 tools with zero config. Trading and account tools need `PRIVATE_KEY` (and
 `WALLET_ADDRESS`, derived from the key if omitted).
 
+Optional API-key authorization (all supplied via env, never in code):
+
+| Env var | Purpose |
+|---------|---------|
+| `POLY_BUILDER_API_KEY` / `POLY_BUILDER_SECRET` / `POLY_BUILDER_PASSPHRASE` | Polymarket builder API key — authorizes builder-attributed CLOB requests and gasless relayer operations. Takes precedence when all three are set. |
+| `RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS` | Relayer API key bound to a signer address — authorizes gasless relayer operations only. Used when the builder trio is absent. |
+
 ## Tools
 
 | Tool | Purpose |
