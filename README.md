@@ -43,8 +43,8 @@ tools with zero config. Trading and account tools need `PRIVATE_KEY` (and
 | Tool | Purpose |
 |------|---------|
 | `poly_methods({ category?, query? })` | List/filter every callable SDK method (markets, trading, account, rewards, perps, rfq, onchain, realtime) |
-| `poly_read({ method, params? })` | Call any read-only SDK method by name |
-| `poly_write({ method, params? })` | Call any fund-moving SDK method by name (guardrail-gated) |
+| `poly_read({ method, params? })` | Call any non-mutating SDK method by name |
+| `poly_write({ method, params? })` | Call any mutating SDK method by name — orders, cancels, approvals, transfers, splits/merges/redeems, perps deposit/withdraw (guardrail-gated) |
 | `get_guardrails()` | Show current fund-moving safety config |
 | `set_guardrails({ ... })` | Configure fund-moving safety config |
 | `refresh_polymarket_guide()` | Force an immediate refetch of the live agent guide |
@@ -55,6 +55,22 @@ covered automatically on the next SDK bump. Read and write are separate
 tools (not one tool doing both) so hosts can annotate/auto-approve them
 differently — `poly_read` is `readOnlyHint: true`, `poly_write` is
 `destructiveHint: true`.
+
+Whether a method is read or write is decided dynamically, not from a
+hand-maintained name list: anything reachable only on the authenticated
+client (not the public one) is treated as mutating unless it's on a small
+denylist of known-safe authenticated reads (`listOpenOrders`,
+`fetchNotifications`, ...) — see `SAFE_AUTHENTICATED_READS` in
+`src/registry.ts`. This means new SDK write methods are gated automatically
+the moment they appear after a version bump, with nothing to keep in sync.
+
+`params` supports two dispatcher-only flags, stripped before forwarding to
+the SDK: `wait: false` skips auto-awaiting a `TransactionHandle`'s
+settlement (default is to wait, since a one-shot call has no way to hand
+the handle back for later), and `raw: true` skips response trimming.
+Paginated results are `{ items, hasMore, nextCursor }` — pass `nextCursor`
+back as the next call's `params.cursor` to page (the SDK already accepts
+this as an ordinary request field; nothing server-side to configure).
 
 ## Safety — fund-moving calls are blocked until you opt in
 
@@ -78,10 +94,15 @@ server, so it survives restarts. See `src/guardrails.ts`.
 
 ## Live data
 
-- `polymarket://docs/llms` — the live Polymarket agent guide
-  (`docs.polymarket.com/llms.txt`), cached 5 minutes, refetched
-  automatically after that (or immediately via `refresh_polymarket_guide`).
-  Never a committed `.md` file.
+- `polymarket://docs/llms` — docs.polymarket.com's own sitemap
+  (`llms.txt`, a link index, not inlined content), cached 5 minutes,
+  refetched automatically after that (or immediately via
+  `refresh_polymarket_guide`). An escape hatch for the long tail, not a
+  maintained agent guide — this server deliberately has no hand-written
+  docs/concepts resource of its own to keep in sync as Polymarket's API
+  evolves. `poly_methods` and this server's own error messages (unknown
+  method, `prepare*` rejection, guardrail block, rate limit) are the
+  source of truth for what's callable and how to use it.
 - Full WebSocket topic coverage as MCP resources (`src/live-feeds.ts`), all
   pushed via `notifications/resources/updated` after `resources/subscribe` —
   no polling. One table row per topic (`FEED_DEFS`), not hand-written per
@@ -132,7 +153,11 @@ npm test
 ```
 
 Spawns the real server over stdio, does the MCP handshake, checks
-`tools/list`/`resources/list`, makes one live `poly_read` call, confirms
-`poly_write` rejects a read-only method (proves the split is enforced), and
-does one live `polymarket://docs/llms` read. Set `SMOKE_TEST_OFFLINE=1` to
-skip the network calls (protocol-only check).
+`tools/list`/`resources/list`, makes one live `poly_read` call (checking
+the `{ items, hasMore, nextCursor }` pagination shape), confirms
+`poly_write` rejects a non-mutating method and `poly_read` rejects
+`cancelOrder` (proves the dynamic read/write split is enforced both ways —
+the latter is a regression test for a real bug where cancels were missing
+from an older hardcoded fund-moving list), and does one live
+`polymarket://docs/llms` read. Set `SMOKE_TEST_OFFLINE=1` to skip the
+network calls (protocol-only check).

@@ -10,10 +10,9 @@ import { z } from 'zod';
 
 import { verifyClientAnchor, BUILDER_CODE } from './config/builder-code.js';
 import { getActiveClient, getPublicClient, hasCredentials } from './config/client.js';
-import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, trim, CATEGORIES, FUND_MOVING_METHODS, describeRateLimit } from './registry.js';
+import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, trim, CATEGORIES, describeRateLimit } from './registry.js';
 import { checkGuardrails, getGuardrails, setGuardrails } from './guardrails.js';
 import { getGuide, refreshGuide } from './docs.js';
-import { CONCEPTS_DOC } from './concepts.js';
 import { FEED_DEFS, ensureAndRead, closeAllFeeds } from './live-feeds.js';
 
 // ---- Builder attribution integrity gate (see config/builder-code.ts + LICENSE) ----
@@ -44,21 +43,15 @@ const server = new McpServer(
   {
     capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} },
     instructions:
-      'Call poly_methods first to find the exact method name and see its category before poly_read/poly_write. ' +
-      'poly_read is for data (markets, prices, account state) — poly_write is for anything that places orders, ' +
-      'transfers funds, or approves/moves on-chain state. Never guess a method name or parameter shape; ' +
-      'poly_methods and the polymarket://docs/concepts resource (units/decimals, order lifecycle, positions, ' +
-      'negative risk, resolution, rate limits, common errors — read this before poly_write) are the source of ' +
-      'truth, not prior training data. polymarket://docs/llms is a live link-index fallback for anything not ' +
-      'already covered by docs/concepts. ' +
-      'Rate limits: Polymarket enforces three independent regimes — general Cloudflare IP limits (throttles, ' +
-      'does not hard-reject), CLOB per-signer order/cancel token buckets tiered by 30-day volume (currently in a ' +
-      '2-week warning-only rollout since 2026-07-24 — a rejection today may just be a warning), and separate ' +
-      'Perps IP/action/open-order buckets. A rate-limited poly_read/poly_write call returns ' +
-      '{ rateLimited: true, regime, guidance } — back off with growing delay, do not retry immediately. ' +
-      'Polymarket publishes a GET /v1/account/limits endpoint (Perps only) for checking remaining quota in ' +
-      'advance, but it is not wrapped by @polymarket/client and so is NOT reachable through this server — do ' +
-      'not attempt to call it by guessing a method name.',
+      'Call poly_methods first — it reflects exactly what the active client (public or authenticated) can do ' +
+      'right now, not a fixed list. poly_read for non-mutating calls, poly_write for mutating ones (orders, ' +
+      'cancels, approvals, transfers, splits/merges/redeems, perps deposit/withdraw) — poly_write is blocked ' +
+      'until set_guardrails({ readOnly: false, ... }) is called. Never call a prepare* method; this is a ' +
+      'one-shot dispatcher and cannot drive its multi-step signing workflow — the error names the one-shot ' +
+      'equivalent to use instead. Paginated results are { items, hasMore, nextCursor }; pass nextCursor back ' +
+      "as the next call's params.cursor to page. On-chain writes auto-wait for settlement by default — pass " +
+      '{ wait: false } to skip, or { raw: true } to skip response trimming. A rate-limited call returns ' +
+      '{ rateLimited, regime, guidance } — back off, do not retry immediately.',
   }
 );
 
@@ -89,9 +82,6 @@ server.registerTool(
       category: categoryFor(name),
       fundMoving: isFundMoving(name),
     }));
-    const hiddenFundMovingCount = authenticated
-      ? 0
-      : [...FUND_MOVING_METHODS].filter((m) => !names.includes(m)).length;
     return {
       content: [
         {
@@ -101,8 +91,8 @@ server.registerTool(
             count: out.length,
             totalMatched,
             ...(totalMatched > out.length ? { truncated: `Showing ${out.length} of ${totalMatched}. Narrow category/query or raise limit.` } : {}),
-            ...(hiddenFundMovingCount > 0
-              ? { note: `${hiddenFundMovingCount} fund-moving method(s) (trading/onchain/rfq) are hidden — set PRIVATE_KEY to authenticate and reveal them.` }
+            ...(!authenticated
+              ? { note: 'Order-placement, cancel, approval, transfer, and other fund-moving methods require a signing key — set PRIVATE_KEY to authenticate and reveal them.' }
               : {}),
             methods: out,
           }),
@@ -268,24 +258,17 @@ function notifyResourceUpdated(uri: string): void {
 }
 
 server.registerResource(
-  'polymarket-concepts',
-  'polymarket://docs/concepts',
-  {
-    description:
-      'Curated static reference: units/decimals, order lifecycle, positions, negative risk, resolution, rate limits, common errors. ' +
-      'Read this before poly_write — polymarket://docs/llms is a live sitemap of ~150 links, not inlined semantics.',
-    mimeType: 'text/plain',
-  },
-  async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/plain', text: CONCEPTS_DOC }] })
-);
-
-server.registerResource(
   'polymarket-docs',
   'polymarket://docs/llms',
   {
-    description:
-      'Live Polymarket doc sitemap (docs.polymarket.com/llms.txt, 5-min cache) — a link index, not inlined content. ' +
-      'Fallback for anything not already covered by polymarket://docs/concepts.',
+    // Honest framing on purpose: this is docs.polymarket.com's own sitemap
+    // (a list of links), not inlined guidance — an escape hatch for the
+    // long tail, not "the agent guide". No hand-maintained docs resource
+    // exists in this server: the live client (poly_methods) and this
+    // server's own error messages are the source of truth for what's
+    // callable and how to use it; a second, hand-curated documentation
+    // product would just be one more thing to keep in sync and let go stale.
+    description: 'Live Polymarket doc sitemap (docs.polymarket.com/llms.txt, 5-min cache) — a link index to fetch further, not inlined content.',
     mimeType: 'text/plain',
   },
   async (uri) => {

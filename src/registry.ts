@@ -5,36 +5,62 @@
  */
 
 import { RateLimitError } from '@polymarket/client';
+import { getPublicClient } from './config/client.js';
 
-/** Methods that move funds, approve access, or commit to a trade — gated by guardrails. */
-export const FUND_MOVING_METHODS = new Set([
-  // order placement
-  'placeLimitOrder',
-  'placeMarketOrder',
-  'createLimitOrder',
-  'createMarketOrder',
-  'postOrder',
-  'postOrders',
-  // approvals
-  'approveErc20',
-  'approveErc1155ForAll',
-  'setupTradingApprovals',
-  // on-chain position actions
-  'splitPosition',
-  'mergePositions',
-  'redeemPositions',
-  'executeCollateralReturnPlan',
-  // transfers
-  'transferErc20',
-  // perps fund movement
-  'depositToPerps',
-  'withdrawFromPerps',
-  // sessions that commit to trading
-  'openPerpsSession',
-  'openRfqSession',
+// ---- Fund-moving classification --------------------------------------------
+//
+// Gated by capability, not a frozen name list: a method is "fund-moving"
+// (must go through poly_write + guardrails) whenever it ISN'T on the public
+// (unauthenticated) client — i.e. it requires a signing key — unless it's on
+// the small SAFE_AUTHENTICATED_READS denylist below. This means new SDK
+// write methods are gated automatically the moment they appear on the
+// secure client after an @polymarket/client bump, with no set to keep in
+// sync. It also means every method actually reachable is dynamically
+// discovered (poly_methods, listMethodNames) — this file classifies, it
+// doesn't enumerate.
+//
+// Concretely fixes a real bug this replaces: cancelOrder/cancelOrders/
+// cancelAll/cancelMarketOrders were never in the old hardcoded
+// FUND_MOVING_METHODS list (a plain oversight — cancels change trading
+// state exactly like placing an order does), so they were callable through
+// poly_read, completely bypassing the readOnly guardrail gate. Under this
+// rule they're gated correctly with no name added anywhere: they're
+// secure-only and not on the denylist.
+
+let publicMethodNamesCache: Set<string> | null = null;
+
+/** Lazy + cached — getPublicClient() is a pure local construction (see config/client.ts), no network I/O, safe to call repeatedly. */
+function publicMethodNames(): Set<string> {
+  if (!publicMethodNamesCache) {
+    publicMethodNamesCache = new Set(listMethodNames(getPublicClient()));
+  }
+  return publicMethodNamesCache;
+}
+
+/**
+ * Authenticated-only methods that read account state but don't move funds,
+ * approve access, or commit to a trade — carved out of the "secure-only =
+ * gated" default above. Keep this short, and only ever remove from it: if
+ * a new method's safety is unclear, leaving it gated (requiring
+ * set_guardrails) is the safe default, not adding it here.
+ */
+const SAFE_AUTHENTICATED_READS = new Set([
+  'listOpenOrders',
+  'fetchOrder',
+  'fetchOrderScoring',
+  'fetchOrdersScoring',
+  'fetchClosedOnlyMode',
+  'fetchNotifications',
+  'dropNotifications',
+  'fetchRewardPercentages',
+  'fetchTotalEarningsForUserForDay',
+  'listUserEarningsForDay',
+  'listUserEarningsAndMarketsConfig',
+  'listAccountTrades',
+  'waitForOrderFillSettlement',
 ]);
 
-/** Subset of FUND_MOVING_METHODS with a {tokenId, price, size, side}-shaped request, eligible for notional/deviation checks. */
+/** Subset of fund-moving methods with a {tokenId, price, size, side}-shaped request, eligible for notional/deviation checks. */
 export const ORDER_METHODS = new Set([
   'placeLimitOrder',
   'placeMarketOrder',
@@ -43,7 +69,7 @@ export const ORDER_METHODS = new Set([
 ]);
 
 /**
- * Subset of FUND_MOVING_METHODS with a raw `amount: bigint | 'max'` request
+ * Subset of the fund-moving methods with a raw `amount: bigint | 'max'` request
  * field denominated in pUSD base units (confirmed against the SDK's own
  * types — e.g. DepositToPerpsRequest.amount doc: "Collateral amount in base
  * units" — and against pUSD's fixed 6 decimals, docs.polymarket.com/
@@ -52,11 +78,12 @@ export const ORDER_METHODS = new Set([
  * PrepareLimitOrderRequest.size — do not apply the same base-units
  * conversion there, it would be wrong by 10^6.
  *
- * redeemPositions, executeCollateralReturnPlan, setupTradingApprovals, and
- * approveErc1155ForAll are FUND_MOVING_METHODS too but carry no checkable
- * amount (redeem always redeems the full winning balance; the other two
- * take no amount or an opaque pre-computed plan/no request at all) — left
- * out of this set deliberately, not an oversight.
+ * redeemPositions, executeCollateralReturnPlan, and setupTradingApprovals
+ * are fund-moving too (secure-only, not on SAFE_AUTHENTICATED_READS) but
+ * carry no checkable amount (redeem always redeems the full winning
+ * balance; the other two take no amount or an opaque pre-computed
+ * plan/no request at all) — left out of this set deliberately, not an
+ * oversight.
  */
 export const COLLATERAL_AMOUNT_METHODS = new Set([
   'approveErc20',
@@ -67,7 +94,7 @@ export const COLLATERAL_AMOUNT_METHODS = new Set([
 ]);
 
 export function isFundMoving(method: string): boolean {
-  return FUND_MOVING_METHODS.has(method);
+  return !publicMethodNames().has(method) && !SAFE_AUTHENTICATED_READS.has(method);
 }
 
 export function isOrderMethod(method: string): boolean {
@@ -120,17 +147,69 @@ function isDrivableWorkflow(value: unknown): boolean {
   );
 }
 
-/** Calls a method on the client by name. Handles both Promise-returning and Paginated-returning SDK methods. */
+/**
+ * True for the SDK's TransactionHandle shape (returned by approveErc20,
+ * splitPosition, mergePositions, depositToPerps, withdrawFromPerps, ...):
+ * { transactionHash, transactionId, wait(): Promise<TransactionOutcome> }.
+ * Detected structurally (has transactionHash + a wait function), not by a
+ * method name list, for the same reason isDrivableWorkflow is.
+ */
+function isTransactionHandle(value: unknown): value is { wait: () => Promise<unknown> } {
+  return !!value && typeof value === 'object' && 'transactionHash' in (value as any) && typeof (value as any).wait === 'function';
+}
+
+/**
+ * Calls a method on the client by name. Handles both Promise-returning and
+ * Paginated-returning SDK methods.
+ *
+ * Two dispatcher-only flags are read out of an object-shaped `params` and
+ * never forwarded to the SDK:
+ *  - `wait: false` — skip auto-awaiting a returned TransactionHandle's
+ *    `.wait()`. Default is to wait: a one-shot MCP call has no way to hand
+ *    a live handle back for a later poly_read, so returning only
+ *    {transactionHash, transactionId: null} by default would leave the
+ *    agent with no way to learn whether the transaction actually settled.
+ *  - `raw: true` — skip trim() and return the SDK's response untouched
+ *    (debugging escape hatch; default stays trimmed for token budget).
+ * Array-shaped params (the SDK's own batch methods — fetchPrices,
+ * fetchMidpoints, fetchOrderBooks, ...) pass through unchanged; these two
+ * flags aren't supported there since there's no top-level object to read
+ * them from.
+ *
+ * Pagination needs no special handling: SDK Paginated methods already
+ * accept `cursor`/`pageSize` as ordinary request fields, and their
+ * `Page<T>` result already carries `items`/`hasMore`/`nextCursor` straight
+ * through trim() unchanged (verified live: passing a previous response's
+ * nextCursor back as the next call's params.cursor advances the page).
+ * An agent pages by doing exactly that.
+ */
 export async function callMethod(client: any, method: string, params: unknown): Promise<unknown> {
   const fn = client[method];
   if (typeof fn !== 'function') {
     throw new Error(`Unknown method "${method}". Call poly_methods to list what's available on the active client.`);
   }
-  const result = params === undefined ? fn() : fn(params);
+
+  let raw = false;
+  let skipWait = false;
+  let forwarded = params;
+  if (params && typeof params === 'object' && !Array.isArray(params)) {
+    const p = { ...(params as Record<string, unknown>) };
+    if ('raw' in p) {
+      raw = p.raw === true;
+      delete p.raw;
+    }
+    if ('wait' in p) {
+      skipWait = p.wait === false;
+      delete p.wait;
+    }
+    forwarded = p;
+  }
+
+  const result = forwarded === undefined ? fn() : fn(forwarded);
   if (result && typeof result.firstPage === 'function') {
-    // Paginated result (list_* style) — return the first page, trimmed.
+    // Paginated result (list_* style) — return the first page.
     const page = await result.firstPage();
-    return trim(page);
+    return raw ? page : trim(page);
   }
   const resolved = await result;
   if (isDrivableWorkflow(resolved)) {
@@ -141,7 +220,11 @@ export async function callMethod(client: any, method: string, params: unknown): 
         `method for approvals/transfers/splits/merges/redemptions/perps-deposit.`
     );
   }
-  return trim(resolved);
+  if (isTransactionHandle(resolved) && !skipWait) {
+    const outcome = await resolved.wait();
+    return raw ? outcome : trim(outcome);
+  }
+  return raw ? resolved : trim(resolved);
 }
 
 // ---- Rate-limit classification ---------------------------------------------

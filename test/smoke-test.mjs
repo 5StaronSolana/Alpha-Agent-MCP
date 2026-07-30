@@ -57,12 +57,27 @@ async function main() {
   if (!Array.isArray(data.items)) {
     throw new Error(`Unexpected poly_read shape: ${JSON.stringify(data).slice(0, 200)}`);
   }
-  console.log(`poly_read OK — got ${data.items.length} live market(s).`);
+  if (typeof data.hasMore !== 'boolean' || !('nextCursor' in data)) {
+    throw new Error(`poly_read pagination fields missing: ${JSON.stringify(data).slice(0, 200)}`);
+  }
+  console.log(`poly_read OK — got ${data.items.length} live market(s), hasMore=${data.hasMore}.`);
 
   console.log('Verifying poly_write rejects a read-only method (proves the read/write split is enforced)...');
   const wrongTool = await client.callTool({ name: 'poly_write', arguments: { method: 'listMarkets', params: {} } });
   if (!wrongTool.isError) throw new Error('poly_write should have rejected a read-only method');
   console.log('poly_write correctly rejected listMarkets.');
+
+  // Regression test for a real bug: cancelOrder/cancelOrders/cancelAll/
+  // cancelMarketOrders were never in the old hardcoded FUND_MOVING_METHODS
+  // list, so they were callable via poly_read — completely bypassing the
+  // readOnly guardrail gate for a call that mutates trading state exactly
+  // like placing an order does. Fixed by classifying fund-moving dynamically
+  // (secure-only + not on a small safe-reads denylist) instead of a name
+  // list that can silently miss new write methods.
+  console.log('Verifying poly_read rejects cancelOrder (secure-only + mutating — must not bypass guardrails)...');
+  const cancelViaRead = await client.callTool({ name: 'poly_read', arguments: { method: 'cancelOrder', params: { orderID: 'x' } } });
+  if (!cancelViaRead.isError) throw new Error('poly_read should have rejected cancelOrder as fund-moving');
+  console.log('poly_read correctly rejected cancelOrder.');
 
   console.log('Reading polymarket://docs/llms (live fetch from docs.polymarket.com)...');
   const doc = await client.readResource({ uri: 'polymarket://docs/llms' });
