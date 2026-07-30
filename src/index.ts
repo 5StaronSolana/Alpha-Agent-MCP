@@ -10,7 +10,7 @@ import { z } from 'zod';
 
 import { verifyClientAnchor, BUILDER_CODE } from './config/builder-code.js';
 import { getActiveClient, getPublicClient, hasCredentials } from './config/client.js';
-import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, trim, CATEGORIES, describeRateLimit } from './registry.js';
+import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, CATEGORIES, describeRateLimit } from './registry.js';
 import { checkGuardrails, getGuardrails, setGuardrails } from './guardrails.js';
 import { getGuide, refreshGuide } from './docs.js';
 import { FEED_DEFS, ensureAndRead, closeAllFeeds } from './live-feeds.js';
@@ -51,7 +51,12 @@ const server = new McpServer(
       'equivalent to use instead. Paginated results are { items, hasMore, nextCursor }; pass nextCursor back ' +
       "as the next call's params.cursor to page. On-chain writes auto-wait for settlement by default — pass " +
       '{ wait: false } to skip, or { raw: true } to skip response trimming. A rate-limited call returns ' +
-      '{ rateLimited, regime, guidance } — back off, do not retry immediately.',
+      '{ rateLimited, regime, guidance } — back off, do not retry immediately. poly_methods lists names only, ' +
+      'not per-method field schemas — if unsure of a method\'s request shape, call it with {} (or a guessed ' +
+      'shape) first: the SDK\'s own validation error lists exactly which fields are missing/invalid before it ' +
+      'ever reaches the network. Live-feed resources return { events, status, lastEventAt } — status is ' +
+      "'connected' | 'reconnecting' | 'failed'; treat non-'connected' as stale data, not an error to retry " +
+      'yourself (the server reconnects with backoff on its own).',
   }
 );
 
@@ -119,14 +124,28 @@ server.registerTool(
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   async ({ method, params }) => {
-    if (isFundMoving(method)) {
-      return {
-        isError: true,
-        content: [{ type: 'text', text: `"${method}" moves funds/state — call it via poly_write, not poly_read.` }],
-      };
-    }
     try {
       const client = await getActiveClient();
+      // Existence check BEFORE the fund-moving classification: isFundMoving()
+      // is "not on the public client and not a known safe read", which is
+      // also true of names that don't exist at all — so a typo'd method used
+      // to get back "moves funds/state — call it via poly_write", sending the
+      // agent to a tool that would fail it differently (verified live
+      // 2026-07-30 with a nonsense method name).
+      if (typeof (client as any)[method] !== 'function') {
+        const text = hasCredentials()
+          ? `Unknown method "${method}" — call poly_methods to list what's available.`
+          : `"${method}" is not available on the public (unauthenticated) client — either it requires PRIVATE_KEY ` +
+            '(fund-moving methods only appear once authenticated, and go through poly_write) or it does not exist. ' +
+            'Call poly_methods to list what is callable right now.';
+        return { isError: true, content: [{ type: 'text', text }] };
+      }
+      if (isFundMoving(method)) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `"${method}" moves funds/state — call it via poly_write, not poly_read.` }],
+        };
+      }
       const result = await callMethod(client, method, params);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     } catch (err: any) {
@@ -163,8 +182,31 @@ server.registerTool(
         content: [{ type: 'text', text: `"${method}" is read-only — call it via poly_read, not poly_write.` }],
       };
     }
+    // Without credentials every fund-moving name passes isFundMoving (they're
+    // all "not on the public client"), including typos — and the guardrail
+    // block would fire first, telling the agent it was "blocked" when the
+    // real problem is there's no signing key at all. Say that plainly instead.
+    if (!hasCredentials()) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text:
+              'No signing key configured — the authenticated client is unavailable, so no fund-moving method can run ' +
+              '(and unknown method names cannot be distinguished from real ones). Set PRIVATE_KEY and restart to enable poly_write.',
+          },
+        ],
+      };
+    }
     try {
       const client = await getActiveClient();
+      if (typeof (client as any)[method] !== 'function') {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Unknown method "${method}" — call poly_methods to list what's available.` }],
+        };
+      }
       const context: { currentMid?: number; openOrderCount?: number } = {};
       if (isOrderMethod(method) && params && typeof (params as any).tokenId === 'string') {
         try {
@@ -188,7 +230,28 @@ server.registerTool(
         return { isError: true, content: [{ type: 'text', text: JSON.stringify({ blocked: true, reason: verdict.reason }) }] };
       }
       const result = await callMethod(client, method, params);
-      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+
+      if (!isOrderMethod(method)) {
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      }
+
+      // A position just opened/changed — make sure it's actually being watched
+      // rather than relying on the agent to remember to ask. This primes both
+      // feeds now (so their event buffers are warm) and tells the agent the
+      // exact resource URIs to call resources/subscribe on to get pushed
+      // updates (fills, cancels, resolution) until the position is closed.
+      // Nested (not spread onto result): result's own shape is untouched no
+      // matter what type it is (object, array, or primitive) — spreading it
+      // would silently mangle an array or drop a primitive result.
+      const uris: string[] = ['polymarket://user/activity'];
+      if (typeof (params as any)?.tokenId === 'string') {
+        uris.push(`polymarket://market/${(params as any).tokenId}/book`);
+      }
+      await Promise.all(uris.map((uri) => ensureAndRead(uri, () => notifyResourceUpdated(uri)).catch(() => {})));
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ result, subscribeToTrackThisPosition: uris }) }],
+      };
     } catch (err: any) {
       const rateLimit = describeRateLimit(err);
       if (rateLimit) {
@@ -295,8 +358,10 @@ for (const def of FEED_DEFS) {
       mimeType: 'application/json',
     },
     async (uri) => {
-      const events = await ensureAndRead(uri.href, () => notifyResourceUpdated(uri.href));
-      return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(trim(events)) }] };
+      // events are already trimmed per-push in live-feeds.ts; status/lastEventAt
+      // let an agent tell frozen data from genuinely fresh data (see live-feeds.ts).
+      const snapshot = await ensureAndRead(uri.href, () => notifyResourceUpdated(uri.href));
+      return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(snapshot) }] };
     }
   );
 }
@@ -311,6 +376,16 @@ async function main() {
       ? 'alpha-agent-mcp ready (authenticated — guardrails ' + (getGuardrails().readOnly ? 'READ-ONLY' : 'trading enabled') + ')'
       : 'alpha-agent-mcp ready (read-only — no PRIVATE_KEY set)'
   );
+  if (hasCredentials()) {
+    // Prime the position/fill feed at startup rather than waiting for an
+    // agent to think to subscribe — so anything that happens between server
+    // start and the agent's first resources/subscribe call is still buffered,
+    // not missed. Best-effort: a startup network hiccup here shouldn't crash
+    // the server; live-feeds.ts's own reconnect loop keeps retrying it.
+    ensureAndRead('polymarket://user/activity', () => notifyResourceUpdated('polymarket://user/activity')).catch((err) =>
+      console.error('warning: could not prime polymarket://user/activity at startup —', err?.message || err)
+    );
+  }
 }
 
 process.on('SIGINT', async () => {

@@ -53,9 +53,19 @@ REGISTERED_HOST=""
 # Claude Code has a real CLI for this — register it directly instead of
 # making the caller hand-edit a config file. Idempotent: a prior install
 # under the same name is removed first so re-running never hard-fails.
-if command -v claude >/dev/null 2>&1; then
+#
+# Gated on $CLAUDECODE=1, not just `command -v claude`: on a machine running
+# multiple agent hosts side by side (Hermes, OpenClaw, ... all coexisting
+# with a globally-installed Claude Code CLI), `command -v claude` alone is a
+# false positive — it detects the binary is *somewhere* in PATH, not that
+# Claude Code is the process actually running this script. $CLAUDECODE=1 is
+# the real, verifiable signal Claude Code sets for its own subprocesses;
+# other hosts' shelled-out `curl | bash` runs won't have it. Registering into
+# the wrong host's config silently (while printing a message that reads like
+# success) is worse than not auto-registering at all.
+if [ "${CLAUDECODE:-}" = "1" ] && command -v claude >/dev/null 2>&1; then
   echo ""
-  echo "==> Claude Code detected — registering the MCP server directly"
+  echo "==> Claude Code session detected — registering the MCP server directly"
   claude mcp remove "${MCP_NAME}" -s user >/dev/null 2>&1 || true
   if claude mcp add "${MCP_NAME}" -s user -- node "${INSTALL_DIR}/dist/index.js"; then
     REGISTERED_HOST="claude-code"
@@ -63,6 +73,12 @@ if command -v claude >/dev/null 2>&1; then
   else
     echo "warning: 'claude mcp add' failed — falling back to manual config below." >&2
   fi
+elif command -v claude >/dev/null 2>&1; then
+  echo ""
+  echo "==> Claude Code CLI found on this machine, but this installer isn't running inside a Claude Code"
+  echo "    session (no \$CLAUDECODE env var) — skipping auto-registration so it doesn't land in the wrong"
+  echo "    host's config. If this install IS meant for Claude Code, register it yourself with:"
+  echo "      claude mcp add ${MCP_NAME} -s user -- node ${INSTALL_DIR}/dist/index.js"
 fi
 
 echo ""

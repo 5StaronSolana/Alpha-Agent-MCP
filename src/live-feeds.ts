@@ -73,7 +73,14 @@ export function isLiveFeedUri(uri: string): boolean {
   return matchFeed(uri) !== null;
 }
 
-type FeedState = { latest: unknown[]; closing: boolean; close?: () => Promise<void> };
+type FeedStatus = 'connected' | 'reconnecting' | 'failed';
+type FeedState = {
+  latest: unknown[];
+  closing: boolean;
+  close?: () => Promise<void>;
+  status: FeedStatus;
+  lastEventAt: number | null;
+};
 
 // Keyed by in-flight/resolved start promise (not the resolved FeedState) so a
 // synchronous check-then-set around the one `await` boundary in
@@ -81,31 +88,76 @@ type FeedState = { latest: unknown[]; closing: boolean; close?: () => Promise<vo
 // share one subscription, not open two.
 const feeds = new Map<string, Promise<FeedState>>();
 const MAX_BUFFERED_EVENTS = 20;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BASE_DELAY_MS = 1000;
+
+/**
+ * Runs the subscription for as long as the feed is wanted, reconnecting with
+ * capped exponential backoff on any drop. Without this, a WebSocket blip
+ * (real over long-lived sessions) silently froze `state.latest` forever —
+ * every future ensureAndRead() call for that URI kept replaying the same
+ * stale buffer with no error and no signal it had gone stale, which is a
+ * genuine risk for a trading tool if an agent treats frozen data as live.
+ * `status`/`lastEventAt` on the returned state make staleness observable
+ * instead of silent.
+ */
+async function runFeed(def: FeedDef, vars: Vars, state: FeedState, handle: { close(): Promise<void> } & AsyncIterable<unknown>, onUpdate: () => void): Promise<void> {
+  let attempt = 0;
+  let current = handle;
+  while (!state.closing) {
+    state.close = () => current.close();
+    try {
+      for await (const event of current) {
+        if (state.closing) break;
+        state.latest.push(trim(event));
+        if (state.latest.length > MAX_BUFFERED_EVENTS) state.latest.shift();
+        state.lastEventAt = Date.now();
+        state.status = 'connected';
+        attempt = 0;
+        onUpdate();
+      }
+    } catch {
+      /* iteration failed — fall through to reconnect below */
+    }
+    if (state.closing) return;
+
+    attempt++;
+    if (attempt > MAX_RECONNECT_ATTEMPTS) {
+      state.status = 'failed';
+      onUpdate();
+      return;
+    }
+    state.status = 'reconnecting';
+    onUpdate();
+    await new Promise((r) => setTimeout(r, RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1)));
+    if (state.closing) return;
+    try {
+      const client = await getActiveClient();
+      current = await client.subscribe([def.build(vars)]);
+    } catch {
+      /* resubscribe failed — loop retries after the next backoff, up to MAX_RECONNECT_ATTEMPTS */
+    }
+  }
+}
 
 async function startFeed(def: FeedDef, vars: Vars, onUpdate: () => void): Promise<FeedState> {
   if (def.auth && !hasCredentials()) {
     throw new Error(`${def.pattern} requires PRIVATE_KEY (authenticated feed — your own account only).`);
   }
   const client = await getActiveClient();
+  // First attempt happens here, outside runFeed, so a bad tokenId/instrumentId
+  // still rejects this promise immediately instead of vanishing into a
+  // background retry loop the caller never learns about.
   const handle = await client.subscribe([def.build(vars)]);
-  const state: FeedState = { latest: [], closing: false, close: () => handle.close() };
-  (async () => {
-    try {
-      for await (const event of handle) {
-        if (state.closing) break;
-        state.latest.push(trim(event));
-        if (state.latest.length > MAX_BUFFERED_EVENTS) state.latest.shift();
-        onUpdate();
-      }
-    } catch {
-      /* connection dropped — resource reads just return the last known state */
-    }
-  })();
+  const state: FeedState = { latest: [], closing: false, status: 'connected', lastEventAt: null };
+  void runFeed(def, vars, state, handle, onUpdate);
   return state;
 }
 
-/** Ensures a subscription for this URI is running; returns the latest buffered events. */
-export async function ensureAndRead(uri: string, onUpdate: () => void): Promise<unknown[]> {
+export type FeedSnapshot = { events: unknown[]; status: FeedStatus; lastEventAt: number | null };
+
+/** Ensures a subscription for this URI is running; returns the latest buffered events plus connection health. */
+export async function ensureAndRead(uri: string, onUpdate: () => void): Promise<FeedSnapshot> {
   const matched = matchFeed(uri);
   if (!matched) throw new Error(`Not a live-feed URI: ${uri}`);
   let statePromise = feeds.get(uri);
@@ -117,7 +169,11 @@ export async function ensureAndRead(uri: string, onUpdate: () => void): Promise<
     statePromise.catch(() => feeds.delete(uri));
   }
   const state = await statePromise;
-  return state.latest;
+  // Reconnection gave up (MAX_RECONNECT_ATTEMPTS exhausted) — evict so the
+  // *next* read starts a fresh subscription instead of replaying 'failed'
+  // forever. This read still returns the last known snapshot honestly.
+  if (state.status === 'failed') feeds.delete(uri);
+  return { events: state.latest, status: state.status, lastEventAt: state.lastEventAt };
 }
 
 export async function closeAllFeeds(): Promise<void> {

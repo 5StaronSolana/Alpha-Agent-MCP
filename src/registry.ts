@@ -205,6 +205,21 @@ export async function callMethod(client: any, method: string, params: unknown): 
   if (typeof fn !== 'function') {
     throw new Error(`Unknown method "${method}". Call poly_methods to list what's available on the active client.`);
   }
+  if (method === 'subscribe') {
+    // The SDK's subscribe() opens a long-lived WebSocket and returns an async
+    // iterator — a one-shot tool call can neither hold nor drive it, and
+    // letting it dispatch surfaced raw internals ("r.map is not a function")
+    // instead of anything actionable (verified live 2026-07-30).
+    throw new Error(
+      'subscribe opens a long-lived WebSocket this one-shot dispatcher cannot hold. Use the live-feed MCP resources ' +
+        'instead (read once via resources/read, push updates via resources/subscribe): polymarket://market/{tokenId}/book, ' +
+        'polymarket://sports/events, polymarket://comments/{parentEntityType}/{parentEntityId}, ' +
+        'polymarket://prices/crypto/binance/{symbol}, polymarket://prices/crypto/chainlink/{symbol}, ' +
+        'polymarket://prices/equity/{symbol}, polymarket://perps/{instrumentId}/trades|bbo|book|statistics, ' +
+        'polymarket://perps/{instrumentId}/candles/{interval}, polymarket://perps/tickers, and ' +
+        'polymarket://user/activity (requires PRIVATE_KEY).'
+    );
+  }
 
   let raw = false;
   let skipWait = false;
@@ -222,11 +237,32 @@ export async function callMethod(client: any, method: string, params: unknown): 
     forwarded = p;
   }
 
+  if (method === 'fetchPerpsTicker') {
+    // Workaround for a verified upstream bug (@polymarket/client, checked
+    // against its compiled source): the SDK implements fetchPerpsTicker as
+    // "call fetchPerpsTickers with instrumentId as a query param, return the
+    // FIRST element" — but /v1/info/tickers ignores that query param and
+    // always returns the full unfiltered list, so callers always got
+    // instrument 1 (SP500-USD) no matter what they asked for (verified live
+    // 2026-07-30 with instrumentId 6 and 21). Filter client-side instead.
+    // Remove once the SDK filters the result itself.
+    const wanted = (forwarded as Record<string, unknown> | undefined)?.instrumentId;
+    if (typeof wanted !== 'number') {
+      throw new Error('fetchPerpsTicker requires { instrumentId: number } — get IDs from fetchPerpsInstruments.');
+    }
+    const all = await client.fetchPerpsTickers({});
+    const hit = Array.isArray(all) ? all.find((t: any) => t?.instrumentId === wanted) : undefined;
+    if (!hit) {
+      throw new Error(`Perps ticker ${wanted} was not returned by the API — call fetchPerpsInstruments for valid instrument IDs.`);
+    }
+    return raw ? hit : capTotalSize(trim(hit));
+  }
+
   const result = forwarded === undefined ? fn() : fn(forwarded);
   if (result && typeof result.firstPage === 'function') {
     // Paginated result (list_* style) — return the first page.
     const page = await result.firstPage();
-    return raw ? page : trim(page);
+    return raw ? page : capTotalSize(trim(page));
   }
   const resolved = await result;
   if (isDrivableWorkflow(resolved)) {
@@ -239,9 +275,9 @@ export async function callMethod(client: any, method: string, params: unknown): 
   }
   if (isTransactionHandle(resolved) && !skipWait) {
     const outcome = await resolved.wait();
-    return raw ? outcome : trim(outcome);
+    return raw ? outcome : capTotalSize(trim(outcome));
   }
-  return raw ? resolved : trim(resolved);
+  return raw ? resolved : capTotalSize(trim(resolved));
 }
 
 // ---- Rate-limit classification ---------------------------------------------
@@ -358,6 +394,90 @@ export function trim(value: unknown, depth = 0): unknown {
       out[k] = trim(v, depth + 1);
     }
     return out;
+  }
+  return value;
+}
+
+const MAX_TOTAL_CHARS = 20_000;
+
+/**
+ * When shrinking, don't bother descending into a nested array once it's
+ * already smaller than this — at that point its parent's items are compact
+ * and popping the parent is the honest next step.
+ */
+const NESTED_ARRAY_FLOOR_CHARS = 1_500;
+
+type ArrayNode = { arr: unknown[]; descendants: unknown[][] };
+
+/** Collects every array in the tree with its (transitive) descendant arrays, so capTotalSize can shrink innermost bloat before dropping whole items. */
+function collectArrayNodes(value: unknown, nodes: ArrayNode[]): unknown[][] {
+  if (Array.isArray(value)) {
+    const descendants: unknown[][] = [];
+    for (const v of value) descendants.push(...collectArrayNodes(v, nodes));
+    nodes.push({ arr: value, descendants });
+    return [value, ...descendants];
+  }
+  if (value && typeof value === 'object') {
+    const found: unknown[][] = [];
+    for (const v of Object.values(value as Record<string, unknown>)) found.push(...collectArrayNodes(v, nodes));
+    return found;
+  }
+  return [];
+}
+
+/**
+ * trim() bounds each array/string independently (per-item, per-field), but
+ * verified live against Polymarket's Gamma search/listEvents: a handful of
+ * genuinely distinct events (not near-duplicates dedupeSiblingStrings can
+ * collapse) still serialized past 400,000 characters — each event object
+ * duplicates most of its own fields once per nested market, so per-item caps
+ * alone don't bound the aggregate. This is a second, budget-aware pass with
+ * no assumption about *which* field holds the bloat.
+ *
+ * Shrink order matters and is innermost-first: the earlier version popped
+ * from whichever array was largest overall, which for `{ items: [event] }`
+ * is always the OUTER items array (it contains everything) — so a single
+ * oversized event (top-volume events carry 20-30 nested markets) was thrown
+ * away whole, and search/listEvents returned `items: []` with hasMore: true
+ * even at pageSize 1 (verified live 2026-07-30: search totalCount said 1,
+ * items came back empty). Now, when the largest array's own bulk lives in a
+ * sizable nested array (an event's `markets`, a comment's `reactions`), we
+ * descend and pop from that innermost array instead, so top-level items
+ * survive in shortened form. Works identically for `{ items: [...] }`
+ * pagination shapes and search's nested
+ * `{ items: { events: [...], profiles: [...], tags: [...] } }` shape.
+ */
+export function capTotalSize(value: unknown, maxChars = MAX_TOTAL_CHARS): unknown {
+  let serialized = JSON.stringify(value);
+  if (serialized.length <= maxChars) return value;
+  const nodes: ArrayNode[] = [];
+  collectArrayNodes(value, nodes);
+  const nodeByArr = new Map<unknown[], ArrayNode>(nodes.map((n) => [n.arr, n]));
+  let truncated = false;
+  let guard = 0;
+  while (serialized.length > maxChars && guard++ < 5000) {
+    nodes.sort((a, b) => JSON.stringify(b.arr).length - JSON.stringify(a.arr).length);
+    let node = nodes.find((n) => n.arr.length > 0);
+    if (!node) break;
+    // Descend to the innermost still-sizable array before popping anything.
+    for (;;) {
+      const child: unknown[] | undefined = node.descendants
+        .filter((d) => d.length > 0 && JSON.stringify(d).length > NESTED_ARRAY_FLOOR_CHARS)
+        .sort((a, b) => JSON.stringify(b).length - JSON.stringify(a).length)[0];
+      if (!child) break;
+      node = nodeByArr.get(child)!;
+    }
+    node.arr.pop();
+    truncated = true;
+    serialized = JSON.stringify(value);
+  }
+  if (!truncated) return value;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return {
+      ...(value as object),
+      _sizeCapped:
+        'Response was too large even after per-item trimming, so nested lists (innermost first) were shortened to fit a safe size — counts inside items (e.g. an event\'s markets) and trailing items may be incomplete; narrow with pageSize/filters or paginate with cursor instead of relying on this response being complete.',
+    };
   }
   return value;
 }

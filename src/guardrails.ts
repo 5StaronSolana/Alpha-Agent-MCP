@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { isOrderMethod, isMarketOrderMethod, isCollateralAmountMethod } from './registry.js';
 
 /**
@@ -53,7 +54,17 @@ export type Guardrails = {
   maxCollateralActionUsd?: number;
 };
 
-const STORE_PATH = join(process.cwd(), 'guardrails.json');
+/**
+ * Anchored to this module's own location (dist/guardrails.js -> package
+ * root), not process.cwd(). MCP hosts vary in whether they let you pin a
+ * server's working directory — `claude mcp add` has no --cwd flag at all —
+ * so cwd-relative storage scatters guardrails.json across whatever
+ * directory each host happened to be launched from, silently losing
+ * previously-configured limits (back to the safe readOnly default, but
+ * still confusing and hard to find). This guarantees one fixed location
+ * regardless of launch cwd, matching what the README documents.
+ */
+const STORE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'guardrails.json');
 
 let configured = false;
 let current: Guardrails = { readOnly: true };

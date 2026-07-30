@@ -60,19 +60,25 @@ tools with zero config. Trading and account tools need `PRIVATE_KEY` (and
 | `refresh_polymarket_guide()` | Force an immediate refetch of the live agent guide |
 
 No per-method tool schemas to maintain — `poly_methods` is the discovery
-step, `poly_read`/`poly_write` are the dispatch step. New SDK methods are
-covered automatically on the next SDK bump. Read and write are separate
-tools (not one tool doing both) so hosts can annotate/auto-approve them
-differently — `poly_read` is `readOnlyHint: true`, `poly_write` is
-`destructiveHint: true`.
+step, `poly_read`/`poly_write` are the dispatch step, both calling straight
+through to `@polymarket/client`'s own generated methods (nothing hand-rolled
+in between). Read and write are separate tools (not one tool doing both) so
+hosts can annotate/auto-approve them differently — `poly_read` is
+`readOnlyHint: true`, `poly_write` is `destructiveHint: true`.
 
 Whether a method is read or write is decided dynamically, not from a
 hand-maintained name list: anything reachable only on the authenticated
 client (not the public one) is treated as mutating unless it's on a small
 denylist of known-safe authenticated reads (`listOpenOrders`,
 `fetchNotifications`, ...) — see `SAFE_AUTHENTICATED_READS` in
-`src/registry.ts`. This means new SDK write methods are gated automatically
-the moment they appear after a version bump, with nothing to keep in sync.
+`src/registry.ts`.
+
+`poly_methods` lists method names/categories only, not per-method field
+schemas. If a method's request shape is unclear, call it (via `poly_read`/
+`poly_write`) with `{}` or a guessed shape first — the SDK's own zod
+validation returns a field-level error (e.g. `tokenId: Invalid input:
+expected string, received undefined`) before anything hits the network, so
+wrong params cost one round trip, not a guess.
 
 `params` supports two dispatcher-only flags, stripped before forwarding to
 the SDK: `wait: false` skips auto-awaiting a `TransactionHandle`'s
@@ -81,6 +87,31 @@ the handle back for later), and `raw: true` skips response trimming.
 Paginated results are `{ items, hasMore, nextCursor }` — pass `nextCursor`
 back as the next call's `params.cursor` to page (the SDK already accepts
 this as an ordinary request field; nothing server-side to configure).
+
+Responses are bounded twice (`src/registry.ts`): `trim()` caps every array
+to 50 items and every string to 2000 chars, and dedupes verbatim-repeated
+strings across array siblings (Polymarket events repeat the same long
+resolution text across every sibling market). That alone isn't enough for
+Gamma's richer endpoints — `search`/`listEvents` on genuinely distinct
+events (not near-duplicates) measured past 400,000 characters live even
+after per-item trimming, since each event object duplicates most of its own
+fields once per nested market. `capTotalSize()` is a second, budget-aware
+pass (20,000 chars — kept well under a typical MCP host's own per-tool-call
+output ceiling, which is stricter than this server's own budget): if still
+over budget, it repeatedly shrinks whichever
+array anywhere in the response is currently largest until it fits, and adds
+`_sizeCapped` to the response so the drop is visible rather than silent.
+Skipped when `raw: true` is set, same as `trim()`.
+
+`poly_write` calls to order-placing methods (`placeLimitOrder`,
+`placeMarketOrder`, `createLimitOrder`, `createMarketOrder`) automatically
+prime the position's live feeds (`polymarket://user/activity` and, if a
+`tokenId` was in the request, `polymarket://market/{tokenId}/book`) and
+return `{ result, subscribeToTrackThisPosition: [...] }` — the exact URIs to
+call `resources/subscribe` on to get pushed updates until the position
+closes, instead of relying on the agent to remember to ask. If `PRIVATE_KEY`
+is set, `polymarket://user/activity` is also primed at server startup, so
+nothing that happens before the agent's first subscribe is missed.
 
 ## Safety — fund-moving calls are blocked until you opt in
 
@@ -119,7 +150,13 @@ server, so it survives restarts. See `src/guardrails.ts`.
 - Full WebSocket topic coverage as MCP resources (`src/live-feeds.ts`), all
   pushed via `notifications/resources/updated` after `resources/subscribe` —
   no polling. One table row per topic (`FEED_DEFS`), not hand-written per
-  resource:
+  resource. Every read returns `{ events, status, lastEventAt }` —
+  `status` is `'connected' | 'reconnecting' | 'failed'`; treat anything
+  other than `'connected'` as possibly-stale data, not something to retry
+  yourself. On a dropped connection the server reconnects on its own with
+  capped exponential backoff (calling the SDK's own `client.subscribe()`
+  again — no custom transport/WebSocket handling here), so a feed doesn't
+  silently freeze forever the way it would with no reconnect logic at all.
 
   | Resource | SDK topic |
   |---|---|
