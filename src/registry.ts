@@ -51,7 +51,9 @@ const SAFE_AUTHENTICATED_READS = new Set([
   'fetchOrdersScoring',
   'fetchClosedOnlyMode',
   'fetchNotifications',
-  'dropNotifications',
+  // dropNotifications deliberately NOT here: it mutates notification state
+  // (clears the inbox), so it stays gated per the "if unclear, don't
+  // denylist" rule above — it was briefly listed and removed on review.
   'fetchRewardPercentages',
   'fetchTotalEarningsForUserForDay',
   'listUserEarningsForDay',
@@ -60,13 +62,28 @@ const SAFE_AUTHENTICATED_READS = new Set([
   'waitForOrderFillSettlement',
 ]);
 
-/** Subset of fund-moving methods with a {tokenId, price, size, side}-shaped request, eligible for notional/deviation checks. */
+/** Subset of fund-moving methods with an order-shaped request, eligible for notional/deviation checks. */
 export const ORDER_METHODS = new Set([
   'placeLimitOrder',
   'placeMarketOrder',
   'createLimitOrder',
   'createMarketOrder',
 ]);
+
+/**
+ * Market-order subset of ORDER_METHODS. Their request shape differs from
+ * limit orders in exactly the way that matters for the notional guardrail
+ * (verified against the SDK's own types): BUY takes `amount` — already the
+ * desired USD notional, no conversion — and SELL takes `shares`
+ * (human-readable outcome tokens, so USD notional ≈ shares × current mid).
+ * Neither carries `price`/`size`, so the limit-order `price * size` check
+ * silently never fired for these before this split.
+ */
+export const MARKET_ORDER_METHODS = new Set(['placeMarketOrder', 'createMarketOrder']);
+
+export function isMarketOrderMethod(method: string): boolean {
+  return MARKET_ORDER_METHODS.has(method);
+}
 
 /**
  * Subset of the fund-moving methods with a raw `amount: bigint | 'max'` request

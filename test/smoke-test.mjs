@@ -62,6 +62,19 @@ async function main() {
   }
   console.log(`poly_read OK — got ${data.items.length} live market(s), hasMore=${data.hasMore}.`);
 
+  // Regression test: params used to be schema'd as object-only
+  // (z.record), which rejected the SDK's array-shaped batch methods
+  // (fetchMidpoints/fetchPrices/fetchOrderBooks/...) before the dispatcher
+  // ever saw them. Uses a real tokenId from the listMarkets result above.
+  const tokenId = data.items[0]?.outcomes?.yes?.tokenId;
+  if (!tokenId) throw new Error('Could not extract a tokenId from listMarkets result for the batch-params check');
+  console.log('Calling poly_read({ method: "fetchMidpoints", params: [ { tokenId } ] }) — array params must pass the schema...');
+  const batchResult = await client.callTool({ name: 'poly_read', arguments: { method: 'fetchMidpoints', params: [{ tokenId }] } });
+  if (batchResult.isError) {
+    throw new Error(`array-params poly_read errored: ${batchResult.content?.[0]?.text}`);
+  }
+  console.log(`fetchMidpoints OK — ${batchResult.content[0].text.slice(0, 80)}…`);
+
   console.log('Verifying poly_write rejects a read-only method (proves the read/write split is enforced)...');
   const wrongTool = await client.callTool({ name: 'poly_write', arguments: { method: 'listMarkets', params: {} } });
   if (!wrongTool.isError) throw new Error('poly_write should have rejected a read-only method');

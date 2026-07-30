@@ -111,7 +111,10 @@ server.registerTool(
       'Never places orders or moves funds — use poly_write for that. Reference: github.com/Polymarket/ts-sdk',
     inputSchema: {
       method: z.string().describe('exact read-only method name from poly_methods'),
-      params: z.record(z.string(), z.unknown()).optional().describe('request object for this method'),
+      params: z
+        .union([z.record(z.string(), z.unknown()), z.array(z.unknown())])
+        .optional()
+        .describe('request object for this method — or an array for the SDK batch methods (fetchPrices, fetchMidpoints, fetchOrderBooks, ...)'),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
@@ -146,7 +149,10 @@ server.registerTool(
       'until readOnly is turned off. Reference: github.com/Polymarket/ts-sdk',
     inputSchema: {
       method: z.string().describe('exact fund-moving method name from poly_methods'),
-      params: z.record(z.string(), z.unknown()).optional().describe('request object for this method'),
+      params: z
+        .union([z.record(z.string(), z.unknown()), z.array(z.unknown())])
+        .optional()
+        .describe('request object for this method — or an array for the SDK batch methods (fetchPrices, fetchMidpoints, fetchOrderBooks, ...)'),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },

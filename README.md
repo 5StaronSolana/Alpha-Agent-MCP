@@ -7,7 +7,17 @@ per-method hand-written tools: every SDK method is reachable generically.
 
 ## Setup
 
-Requires Node >=24 (matches `@polymarket/client`'s own engine requirement).
+Canonical one-line install (fetches this repo, builds, and self-registers
+with Claude Code when present — the join5star.xyz URL is a live proxy of
+this repo's `install.sh`, and works independently of the marketing page,
+which remains pre-launch):
+
+```bash
+curl -fsSL https://join5star.xyz/mcp/install.sh | bash
+```
+
+Or manually — requires Node >=24 (matches `@polymarket/client`'s own
+engine requirement):
 
 ```bash
 git clone https://github.com/5StaronSolana/Alpha-Agent-MCP.git
@@ -83,7 +93,10 @@ deposit/withdraw, and session-opening RFQ/Perps actions. Read-only methods
 set_guardrails({ "readOnly": false, "maxOrderSizeUsd": 50, "maxPriceDeviationFromMid": 0.05 })
 ```
 
-Fields: `readOnly`, `maxOrderSizeUsd`, `maxPriceDeviationFromMid`,
+Fields: `readOnly`, `maxOrderSizeUsd` (limit orders: `price × size`;
+market BUY: `amount`, which is already USD; market SELL: `shares × live
+mid` — refused outright if the notional can't be established while the cap
+is set), `maxPriceDeviationFromMid`,
 `allowedTokenIds`, `maxOpenOrdersTotal`, `allowedTransferAddresses`,
 `maxCollateralActionUsd` (caps `approveErc20`/`splitPosition`/
 `mergePositions`/`depositToPerps`/`withdrawFromPerps` by USD-converted

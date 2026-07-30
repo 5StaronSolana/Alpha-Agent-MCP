@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { isOrderMethod, isCollateralAmountMethod } from './registry.js';
+import { isOrderMethod, isMarketOrderMethod, isCollateralAmountMethod } from './registry.js';
 
 /**
  * pUSD (Polymarket's sole collateral asset) is fixed at 6 decimals —
@@ -169,10 +169,46 @@ export function checkGuardrails(
 
   const price = Number(params?.price);
   const size = Number(params?.size);
-  if (g.maxOrderSizeUsd != null && Number.isFinite(price) && Number.isFinite(size)) {
-    const notional = price * size;
-    if (notional > g.maxOrderSizeUsd) {
-      return { ok: false, reason: `Order notional $${notional.toFixed(2)} exceeds maxOrderSizeUsd $${g.maxOrderSizeUsd}.` };
+  if (g.maxOrderSizeUsd != null) {
+    // Market orders don't carry price/size — their notional comes from a
+    // different shape entirely (see MARKET_ORDER_METHODS in registry.ts):
+    // BUY `amount` is already the desired USD notional, SELL `shares` needs
+    // the live mid to price it. The old price*size check silently never
+    // fired for these.
+    if (isMarketOrderMethod(method)) {
+      const side = String(params?.side ?? '').toUpperCase();
+      let notional: number | null = null;
+      let how = '';
+      if (side === 'BUY') {
+        const amount = Number(params?.amount);
+        if (Number.isFinite(amount)) {
+          notional = amount;
+          how = `amount $${amount.toFixed(2)}`;
+        }
+      } else if (side === 'SELL') {
+        const shares = Number(params?.shares);
+        if (Number.isFinite(shares) && context.currentMid != null && context.currentMid > 0) {
+          notional = shares * context.currentMid;
+          how = `${shares} shares × mid $${context.currentMid.toFixed(4)} ≈ $${notional.toFixed(2)}`;
+        }
+      }
+      if (notional === null) {
+        // Cap is set but this order's USD value can't be established (bad
+        // side, non-numeric amount/shares, or no live mid for a sell) —
+        // refuse rather than let an unpriceable order through a price cap.
+        return {
+          ok: false,
+          reason: `maxOrderSizeUsd is set but "${method}"'s notional couldn't be established from its params (side=${side || '?'}) — refusing rather than skipping the cap.`,
+        };
+      }
+      if (notional > g.maxOrderSizeUsd) {
+        return { ok: false, reason: `Market order notional (${how}) exceeds maxOrderSizeUsd $${g.maxOrderSizeUsd}.` };
+      }
+    } else if (Number.isFinite(price) && Number.isFinite(size)) {
+      const notional = price * size;
+      if (notional > g.maxOrderSizeUsd) {
+        return { ok: false, reason: `Order notional $${notional.toFixed(2)} exceeds maxOrderSizeUsd $${g.maxOrderSizeUsd}.` };
+      }
     }
   }
 
