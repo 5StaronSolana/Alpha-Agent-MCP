@@ -10,9 +10,10 @@ import { z } from 'zod';
 
 import { verifyClientAnchor, BUILDER_CODE } from './config/builder-code.js';
 import { getActiveClient, getPublicClient, hasCredentials } from './config/client.js';
-import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, trim, CATEGORIES, FUND_MOVING_METHODS } from './registry.js';
+import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, trim, CATEGORIES, FUND_MOVING_METHODS, describeRateLimit } from './registry.js';
 import { checkGuardrails, getGuardrails, setGuardrails } from './guardrails.js';
 import { getGuide, refreshGuide } from './docs.js';
+import { CONCEPTS_DOC } from './concepts.js';
 import { FEED_DEFS, ensureAndRead, closeAllFeeds } from './live-feeds.js';
 
 // ---- Builder attribution integrity gate (see config/builder-code.ts + LICENSE) ----
@@ -46,7 +47,18 @@ const server = new McpServer(
       'Call poly_methods first to find the exact method name and see its category before poly_read/poly_write. ' +
       'poly_read is for data (markets, prices, account state) — poly_write is for anything that places orders, ' +
       'transfers funds, or approves/moves on-chain state. Never guess a method name or parameter shape; ' +
-      'poly_methods and the polymarket://docs/llms resource are the source of truth, not prior training data.',
+      'poly_methods and the polymarket://docs/concepts resource (units/decimals, order lifecycle, positions, ' +
+      'negative risk, resolution, rate limits, common errors — read this before poly_write) are the source of ' +
+      'truth, not prior training data. polymarket://docs/llms is a live link-index fallback for anything not ' +
+      'already covered by docs/concepts. ' +
+      'Rate limits: Polymarket enforces three independent regimes — general Cloudflare IP limits (throttles, ' +
+      'does not hard-reject), CLOB per-signer order/cancel token buckets tiered by 30-day volume (currently in a ' +
+      '2-week warning-only rollout since 2026-07-24 — a rejection today may just be a warning), and separate ' +
+      'Perps IP/action/open-order buckets. A rate-limited poly_read/poly_write call returns ' +
+      '{ rateLimited: true, regime, guidance } — back off with growing delay, do not retry immediately. ' +
+      'Polymarket publishes a GET /v1/account/limits endpoint (Perps only) for checking remaining quota in ' +
+      'advance, but it is not wrapped by @polymarket/client and so is NOT reachable through this server — do ' +
+      'not attempt to call it by guessing a method name.',
   }
 );
 
@@ -125,6 +137,10 @@ server.registerTool(
       const result = await callMethod(client, method, params);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     } catch (err: any) {
+      const rateLimit = describeRateLimit(err);
+      if (rateLimit) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify({ ...rateLimit, message: err.message }) }] };
+      }
       return { isError: true, content: [{ type: 'text', text: err?.message || String(err) }] };
     }
   }
@@ -178,6 +194,10 @@ server.registerTool(
       const result = await callMethod(client, method, params);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     } catch (err: any) {
+      const rateLimit = describeRateLimit(err);
+      if (rateLimit) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify({ ...rateLimit, message: err.message }) }] };
+      }
       return { isError: true, content: [{ type: 'text', text: err?.message || String(err) }] };
     }
   }
@@ -205,6 +225,11 @@ server.registerTool(
       allowedTokenIds: z.array(z.string()).optional(),
       maxOpenOrdersTotal: z.number().nonnegative().optional(),
       allowedTransferAddresses: z.array(z.string()).optional(),
+      maxCollateralActionUsd: z
+        .number()
+        .positive()
+        .optional()
+        .describe('Caps approveErc20/splitPosition/mergePositions/depositToPerps/withdrawFromPerps by USD-converted amount (pUSD, 6 decimals).'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -243,9 +268,26 @@ function notifyResourceUpdated(uri: string): void {
 }
 
 server.registerResource(
+  'polymarket-concepts',
+  'polymarket://docs/concepts',
+  {
+    description:
+      'Curated static reference: units/decimals, order lifecycle, positions, negative risk, resolution, rate limits, common errors. ' +
+      'Read this before poly_write — polymarket://docs/llms is a live sitemap of ~150 links, not inlined semantics.',
+    mimeType: 'text/plain',
+  },
+  async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/plain', text: CONCEPTS_DOC }] })
+);
+
+server.registerResource(
   'polymarket-docs',
   'polymarket://docs/llms',
-  { description: 'Live Polymarket agent guide (docs.polymarket.com/llms.txt, 5-min cache)', mimeType: 'text/plain' },
+  {
+    description:
+      'Live Polymarket doc sitemap (docs.polymarket.com/llms.txt, 5-min cache) — a link index, not inlined content. ' +
+      'Fallback for anything not already covered by polymarket://docs/concepts.',
+    mimeType: 'text/plain',
+  },
   async (uri) => {
     const { text, cachedAgeMs } = await getGuide();
     return { contents: [{ uri: uri.href, mimeType: 'text/plain', text: `${text}\n\n[cached ${Math.round(cachedAgeMs / 1000)}s ago]` }] };

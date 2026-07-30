@@ -4,6 +4,8 @@
  * hand-written tool per method — new SDK methods are covered automatically.
  */
 
+import { RateLimitError } from '@polymarket/client';
+
 /** Methods that move funds, approve access, or commit to a trade — gated by guardrails. */
 export const FUND_MOVING_METHODS = new Set([
   // order placement
@@ -40,12 +42,40 @@ export const ORDER_METHODS = new Set([
   'createMarketOrder',
 ]);
 
+/**
+ * Subset of FUND_MOVING_METHODS with a raw `amount: bigint | 'max'` request
+ * field denominated in pUSD base units (confirmed against the SDK's own
+ * types — e.g. DepositToPerpsRequest.amount doc: "Collateral amount in base
+ * units" — and against pUSD's fixed 6 decimals, docs.polymarket.com/
+ * concepts/pusd). Distinct from ORDER_METHODS, whose `size` field is already
+ * human-readable outcome-token units per the SDK's own doc comment on
+ * PrepareLimitOrderRequest.size — do not apply the same base-units
+ * conversion there, it would be wrong by 10^6.
+ *
+ * redeemPositions, executeCollateralReturnPlan, setupTradingApprovals, and
+ * approveErc1155ForAll are FUND_MOVING_METHODS too but carry no checkable
+ * amount (redeem always redeems the full winning balance; the other two
+ * take no amount or an opaque pre-computed plan/no request at all) — left
+ * out of this set deliberately, not an oversight.
+ */
+export const COLLATERAL_AMOUNT_METHODS = new Set([
+  'approveErc20',
+  'splitPosition',
+  'mergePositions',
+  'depositToPerps',
+  'withdrawFromPerps',
+]);
+
 export function isFundMoving(method: string): boolean {
   return FUND_MOVING_METHODS.has(method);
 }
 
 export function isOrderMethod(method: string): boolean {
   return ORDER_METHODS.has(method);
+}
+
+export function isCollateralAmountMethod(method: string): boolean {
+  return COLLATERAL_AMOUNT_METHODS.has(method);
 }
 
 export function listMethodNames(client: object): string[] {
@@ -112,6 +142,64 @@ export async function callMethod(client: any, method: string, params: unknown): 
     );
   }
   return trim(resolved);
+}
+
+// ---- Rate-limit classification ---------------------------------------------
+//
+// Polymarket enforces three independent rate-limit regimes (general
+// Cloudflare IP limits, CLOB per-signer order/cancel token buckets, and
+// separate Perps IP/action/open-order buckets — see
+// docs.polymarket.com/api-reference/rate-limits,
+// /api-reference/trading-rate-limits, /api-reference/perps/rate-limits).
+// None of that detail reaches this dispatcher, though: @polymarket/client's
+// own HTTP layer throws a bare RateLimitError on any 429 — `throw new
+// RateLimitError(\`Request to ${url} was rate limited\`)` — without reading
+// the Retry-After header or response body first. The class itself carries no
+// fields beyond the message (confirmed against the SDK's compiled source).
+// So retryAfterSeconds/limitType/raw-body are NOT recoverable here no matter
+// how this is wrapped — the only signal available is that message string,
+// which does still embed the request URL, letting us guess *which* regime
+// was hit from the hostname/path. Do not add a `retryAfterSeconds` field
+// that just reads back as null/undefined — that would look like a real,
+// checked value instead of an acknowledged gap.
+const REGIME_HOST_PATTERNS: Array<[string, RegExp]> = [
+  ['perps', /perpetuals\.polymarket\.com|\/perps\b/i],
+  ['clob-trading', /clob\.polymarket\.com\/(order|orders|cancel)/i],
+  ['clob', /clob\.polymarket\.com/i],
+  ['gamma', /gamma-api\.polymarket\.com/i],
+  ['data', /data-api\.polymarket\.com/i],
+  ['bridge', /bridge\.polymarket\.com/i],
+];
+
+function guessRateLimitRegime(message: string): string {
+  for (const [regime, re] of REGIME_HOST_PATTERNS) {
+    if (re.test(message)) return regime;
+  }
+  return 'unknown';
+}
+
+export type RateLimitInfo = { rateLimited: true; regime: string; guidance: string };
+
+/**
+ * Classifies a caught error as a Polymarket rate limit or not. Returns null
+ * for anything else, so callers can fall through to their normal
+ * err.message handling.
+ */
+export function describeRateLimit(err: unknown): RateLimitInfo | null {
+  if (!(err instanceof RateLimitError)) return null;
+  const regime = guessRateLimitRegime(err.message);
+  return {
+    rateLimited: true,
+    regime,
+    guidance:
+      regime === 'clob-trading'
+        ? 'CLOB per-signer order/cancel token bucket (tiered by 30-day volume; live enforcement began rolling out 2026-07-24 after a 2-week warning-only period — this may still be a warning, not a real block). Back off and retry with growing delay; do not resend the same batch unchanged.'
+        : regime === 'perps'
+          ? 'Perps IP, account-action, or open-order bucket. Retry-After is not exposed by the SDK for this error — back off (e.g. 1s, 2s, 4s...) rather than retrying immediately.'
+          : regime === 'clob' || regime === 'gamma' || regime === 'data' || regime === 'bridge'
+            ? `General Cloudflare IP-based limit on the ${regime} API — these throttle/queue rather than hard-reject; a short backoff before retrying is usually enough.`
+            : 'Rate limited by Polymarket; exact bucket unknown from this error alone. Back off with growing delay before retrying.',
+  };
 }
 
 const MAX_ARRAY_ITEMS = 50;

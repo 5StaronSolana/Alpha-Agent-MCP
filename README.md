@@ -68,9 +68,13 @@ set_guardrails({ "readOnly": false, "maxOrderSizeUsd": 50, "maxPriceDeviationFro
 ```
 
 Fields: `readOnly`, `maxOrderSizeUsd`, `maxPriceDeviationFromMid`,
-`allowedTokenIds`, `maxOpenOrdersTotal`, `allowedTransferAddresses`. Config
-persists to `guardrails.json` next to the server, so it survives restarts.
-See `src/guardrails.ts`.
+`allowedTokenIds`, `maxOpenOrdersTotal`, `allowedTransferAddresses`,
+`maxCollateralActionUsd` (caps `approveErc20`/`splitPosition`/
+`mergePositions`/`depositToPerps`/`withdrawFromPerps` by USD-converted
+amount — these take a raw pUSD base-unit `bigint`, unlike order `size`,
+which is already human-readable share units; see the decimals note in
+`src/guardrails.ts`). Config persists to `guardrails.json` next to the
+server, so it survives restarts. See `src/guardrails.ts`.
 
 ## Live data
 

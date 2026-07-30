@@ -1,6 +1,37 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { isOrderMethod } from './registry.js';
+import { isOrderMethod, isCollateralAmountMethod } from './registry.js';
+
+/**
+ * pUSD (Polymarket's sole collateral asset) is fixed at 6 decimals —
+ * docs.polymarket.com/concepts/pusd, and independently confirmed against
+ * @polymarket/client's own compiled source, which hardcodes the identical
+ * `Math.round(x * 10**6)` conversion internally. Not a live-fetched value:
+ * there is nothing to look up per call, this is a protocol-level constant.
+ */
+const PUSD_DECIMALS = 6;
+const PUSD_BASE_UNITS_PER_DOLLAR = 10 ** PUSD_DECIMALS;
+
+/**
+ * Converts a COLLATERAL_AMOUNT_METHODS request's raw `amount` field (base
+ * units, or the 'max' sentinel meaning "as much as the approval allows") to
+ * a USD figure for comparison against maxCollateralActionUsd. Returns null
+ * for anything not confidently convertible — callers must treat null as
+ * "cannot verify this is under the cap", not as $0.
+ */
+function collateralAmountToUsd(amount: unknown): number | null {
+  if (amount === 'max') return Infinity;
+  if (typeof amount === 'bigint') return Number(amount) / PUSD_BASE_UNITS_PER_DOLLAR;
+  if (typeof amount === 'number' && Number.isFinite(amount)) return amount / PUSD_BASE_UNITS_PER_DOLLAR;
+  if (typeof amount === 'string' && amount.trim().length > 0) {
+    try {
+      return Number(BigInt(amount)) / PUSD_BASE_UNITS_PER_DOLLAR;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 /**
  * Safety gate for every fund-moving SDK method routed through poly_call.
@@ -18,6 +49,8 @@ export type Guardrails = {
   allowedTokenIds?: string[];
   maxOpenOrdersTotal?: number;
   allowedTransferAddresses?: string[];
+  /** Caps approveErc20/splitPosition/mergePositions/depositToPerps/withdrawFromPerps by USD-converted amount. See COLLATERAL_AMOUNT_METHODS in registry.ts. */
+  maxCollateralActionUsd?: number;
 };
 
 const STORE_PATH = join(process.cwd(), 'guardrails.json');
@@ -58,6 +91,8 @@ function sanitize(raw: unknown): Guardrails {
     allowedTransferAddresses: Array.isArray(g.allowedTransferAddresses)
       ? g.allowedTransferAddresses.filter((x): x is string => typeof x === 'string')
       : undefined,
+    maxCollateralActionUsd:
+      typeof g.maxCollateralActionUsd === 'number' && g.maxCollateralActionUsd > 0 ? g.maxCollateralActionUsd : undefined,
   };
 }
 
@@ -101,6 +136,23 @@ export function checkGuardrails(
       const allowed = g.allowedTransferAddresses.some((a) => a.toLowerCase() === to.toLowerCase());
       if (!allowed) {
         return { ok: false, reason: `recipient ${to} not in allowedTransferAddresses allowlist.` };
+      }
+    }
+    return { ok: true };
+  }
+
+  if (isCollateralAmountMethod(method)) {
+    if (g.maxCollateralActionUsd != null) {
+      const usd = collateralAmountToUsd(params?.amount);
+      if (usd === null) {
+        return {
+          ok: false,
+          reason: `maxCollateralActionUsd is set but "${method}"'s amount ($${JSON.stringify(params?.amount)}) couldn't be verified against it — refusing rather than letting an unchecked amount through.`,
+        };
+      }
+      if (usd > g.maxCollateralActionUsd) {
+        const shown = Number.isFinite(usd) ? `$${usd.toFixed(2)}` : `"max" (unbounded)`;
+        return { ok: false, reason: `"${method}" amount ${shown} exceeds maxCollateralActionUsd $${g.maxCollateralActionUsd}.` };
       }
     }
     return { ok: true };
