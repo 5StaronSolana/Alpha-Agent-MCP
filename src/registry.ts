@@ -10,7 +10,7 @@ import { getPublicClient } from './config/client.js';
 // ---- Fund-moving classification --------------------------------------------
 //
 // Gated by capability, not a frozen name list: a method is "fund-moving"
-// (must go through poly_write + guardrails) whenever it ISN'T on the public
+// (must go through poly_write) whenever it ISN'T on the public
 // (unauthenticated) client — i.e. it requires a signing key — unless it's on
 // the small SAFE_AUTHENTICATED_READS denylist below. This means new SDK
 // write methods are gated automatically the moment they appear on the
@@ -23,7 +23,7 @@ import { getPublicClient } from './config/client.js';
 // cancelAll/cancelMarketOrders were never in the old hardcoded
 // FUND_MOVING_METHODS list (a plain oversight — cancels change trading
 // state exactly like placing an order does), so they were callable through
-// poly_read, completely bypassing the readOnly guardrail gate. Under this
+// poly_read, completely bypassing the read/write split. Under this
 // rule they're gated correctly with no name added anywhere: they're
 // secure-only and not on the denylist.
 
@@ -41,8 +41,8 @@ function publicMethodNames(): Set<string> {
  * Authenticated-only methods that read account state but don't move funds,
  * approve access, or commit to a trade — carved out of the "secure-only =
  * gated" default above. Keep this short, and only ever remove from it: if
- * a new method's safety is unclear, leaving it gated (requiring
- * set_guardrails) is the safe default, not adding it here.
+ * a new method's safety is unclear, leaving it gated (requiring PRIVATE_KEY
+ * and routing through poly_write) is the safe default, not adding it here.
  */
 const SAFE_AUTHENTICATED_READS = new Set([
   'listOpenOrders',
@@ -62,52 +62,12 @@ const SAFE_AUTHENTICATED_READS = new Set([
   'waitForOrderFillSettlement',
 ]);
 
-/** Subset of fund-moving methods with an order-shaped request, eligible for notional/deviation checks. */
+/** Subset of fund-moving methods with an order-shaped request — used to decide when to prime/return live-feed subscribe URIs after a write. */
 export const ORDER_METHODS = new Set([
   'placeLimitOrder',
   'placeMarketOrder',
   'createLimitOrder',
   'createMarketOrder',
-]);
-
-/**
- * Market-order subset of ORDER_METHODS. Their request shape differs from
- * limit orders in exactly the way that matters for the notional guardrail
- * (verified against the SDK's own types): BUY takes `amount` — already the
- * desired USD notional, no conversion — and SELL takes `shares`
- * (human-readable outcome tokens, so USD notional ≈ shares × current mid).
- * Neither carries `price`/`size`, so the limit-order `price * size` check
- * silently never fired for these before this split.
- */
-export const MARKET_ORDER_METHODS = new Set(['placeMarketOrder', 'createMarketOrder']);
-
-export function isMarketOrderMethod(method: string): boolean {
-  return MARKET_ORDER_METHODS.has(method);
-}
-
-/**
- * Subset of the fund-moving methods with a raw `amount: bigint | 'max'` request
- * field denominated in pUSD base units (confirmed against the SDK's own
- * types — e.g. DepositToPerpsRequest.amount doc: "Collateral amount in base
- * units" — and against pUSD's fixed 6 decimals, docs.polymarket.com/
- * concepts/pusd). Distinct from ORDER_METHODS, whose `size` field is already
- * human-readable outcome-token units per the SDK's own doc comment on
- * PrepareLimitOrderRequest.size — do not apply the same base-units
- * conversion there, it would be wrong by 10^6.
- *
- * redeemPositions, executeCollateralReturnPlan, and setupTradingApprovals
- * are fund-moving too (secure-only, not on SAFE_AUTHENTICATED_READS) but
- * carry no checkable amount (redeem always redeems the full winning
- * balance; the other two take no amount or an opaque pre-computed
- * plan/no request at all) — left out of this set deliberately, not an
- * oversight.
- */
-export const COLLATERAL_AMOUNT_METHODS = new Set([
-  'approveErc20',
-  'splitPosition',
-  'mergePositions',
-  'depositToPerps',
-  'withdrawFromPerps',
 ]);
 
 export function isFundMoving(method: string): boolean {
@@ -116,10 +76,6 @@ export function isFundMoving(method: string): boolean {
 
 export function isOrderMethod(method: string): boolean {
   return ORDER_METHODS.has(method);
-}
-
-export function isCollateralAmountMethod(method: string): boolean {
-  return COLLATERAL_AMOUNT_METHODS.has(method);
 }
 
 export function listMethodNames(client: object): string[] {
@@ -145,23 +101,6 @@ export function categoryFor(method: string): string {
     if (re.test(method)) return cat;
   }
   return 'other';
-}
-
-/**
- * True for the ~19 SDK `prepare*` methods (prepareLimitOrder, prepareErc20Approval,
- * prepareSplitPosition, ...) that resolve to an AsyncGenerator-based signing workflow
- * instead of a plain result — the caller is meant to drive it step-by-step, exchanging
- * signatures across multiple turns. This one-shot dispatcher has no way to do that:
- * detected generically (not by name list, so it can't drift as the SDK adds more of
- * these) rather than assuming which methods return one.
- */
-function isDrivableWorkflow(value: unknown): boolean {
-  return (
-    !!value &&
-    typeof value === 'object' &&
-    typeof (value as any)[Symbol.asyncIterator] === 'function' &&
-    typeof (value as any).next === 'function'
-  );
 }
 
 /**
@@ -265,14 +204,6 @@ export async function callMethod(client: any, method: string, params: unknown): 
     return raw ? page : capTotalSize(trim(page));
   }
   const resolved = await result;
-  if (isDrivableWorkflow(resolved)) {
-    throw new Error(
-      `"${method}" returned a multi-step signing workflow (an AsyncGenerator), which this dispatcher can't drive — ` +
-        `calling it does nothing (no signature exchanged, nothing submitted). Use the direct one-shot equivalent ` +
-        `instead: placeLimitOrder/placeMarketOrder/postOrder(s) for orders, or the corresponding non-"prepare*" ` +
-        `method for approvals/transfers/splits/merges/redemptions/perps-deposit.`
-    );
-  }
   if (isTransactionHandle(resolved) && !skipWait) {
     const outcome = await resolved.wait();
     return raw ? outcome : capTotalSize(trim(outcome));

@@ -69,7 +69,7 @@ if [ "${CLAUDECODE:-}" = "1" ] && command -v claude >/dev/null 2>&1; then
   claude mcp remove "${MCP_NAME}" -s user >/dev/null 2>&1 || true
   if claude mcp add "${MCP_NAME}" -s user -- node "${INSTALL_DIR}/dist/index.js"; then
     REGISTERED_HOST="claude-code"
-    echo "==> Registered as '${MCP_NAME}' in Claude Code (user scope, read-only until credentials are added)."
+    echo "==> Registered as '${MCP_NAME}' in Claude Code (user scope, read-only until PRIVATE_KEY is added)."
   else
     echo "warning: 'claude mcp add' failed — falling back to manual config below." >&2
   fi
@@ -105,9 +105,9 @@ echo "  Linux:   ~/.config/Claude/claude_desktop_config.json"
 echo "  Windows: %APPDATA%\\Claude\\claude_desktop_config.json"
 echo ""
 echo "PRIVATE_KEY / WALLET_ADDRESS are optional — omit both to run read-only"
-echo "discovery/market-data tools with zero config. Trading stays blocked"
-echo "(readOnly guardrail) until set_guardrails is called explicitly, even"
-echo "once real credentials are present."
+echo "discovery/market-data tools with zero config. Trading and account"
+echo "tools only exist on the client once PRIVATE_KEY is set — no separate"
+echo "opt-in step beyond that."
 echo ""
 echo "Also optional, for API-key authorization (env-only, never hardcoded):"
 echo "  POLY_BUILDER_API_KEY / POLY_BUILDER_SECRET / POLY_BUILDER_PASSPHRASE"
@@ -132,6 +132,3 @@ if [ "${REGISTERED_HOST}" = "claude-code" ]; then
   echo "     claude mcp remove ${MCP_NAME} -s user && \\"
   echo "     claude mcp add ${MCP_NAME} -s user -e PRIVATE_KEY=0x... -e WALLET_ADDRESS=0x... -- node ${INSTALL_DIR}/dist/index.js"
 fi
-echo "3. Trading still stays blocked until set_guardrails({ readOnly: false, ... })"
-echo "   is called explicitly — walk your owner through sane limits"
-echo "   (maxOrderSizeUsd, maxPriceDeviationFromMid) before turning it on."

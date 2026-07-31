@@ -59,11 +59,10 @@ Optional API-key authorization (all supplied via env, never in code):
 
 | Tool | Purpose |
 |------|---------|
-| `poly_methods({ category?, query? })` | List/filter every callable SDK method (markets, trading, account, rewards, perps, rfq, onchain, realtime) |
+| `poly_methods({ category?, query?, limit? })` | List/filter every callable SDK method (markets, trading, account, rewards, perps, rfq, onchain, realtime). Returns `categoryCounts` over the full matched set and `totalAvailable`, so even a default-sized response shows the true shape of what's callable |
 | `poly_read({ method, params? })` | Call any non-mutating SDK method by name |
-| `poly_write({ method, params? })` | Call any mutating SDK method by name — orders, cancels, approvals, transfers, splits/merges/redeems, perps deposit/withdraw (guardrail-gated) |
-| `get_guardrails()` | Show current fund-moving safety config |
-| `set_guardrails({ ... })` | Configure fund-moving safety config |
+| `poly_write({ method, params? })` | Call any mutating SDK method by name — orders, cancels, approvals, transfers, splits/merges/redeems, perps deposit/withdraw (requires `PRIVATE_KEY`) |
+| `poly_feed_read({ uri })` | Read a live-feed snapshot by URI — the same feeds as the `polymarket://` resources below, for hosts without MCP resource support. No push updates; call again for a fresh snapshot |
 | `refresh_polymarket_guide()` | Force an immediate refetch of the live agent guide |
 
 No per-method tool schemas to maintain — `poly_methods` is the discovery
@@ -120,28 +119,20 @@ closes, instead of relying on the agent to remember to ask. If `PRIVATE_KEY`
 is set, `polymarket://user/activity` is also primed at server startup, so
 nothing that happens before the agent's first subscribe is missed.
 
-## Safety — fund-moving calls are blocked until you opt in
+## Safety — the credentials boundary is the SDK's, not a policy layer on top
 
-By default, **every fund-moving method is rejected** (`readOnly`): order
-placement, approvals, transfers, split/merge/redeem positions, perps
-deposit/withdraw, and session-opening RFQ/Perps actions. Read-only methods
-(discovery, prices, order books, account viewing) always work.
+`@polymarket/client` exposes two different clients: a public one (market
+data, discovery — no key needed) and a secure one (everything else,
+including every fund-moving method) that only exists once a signing key is
+supplied. This server does not add a second gate on top of that split —
+without `PRIVATE_KEY`, fund-moving methods are simply absent from the
+active client (`poly_methods` won't even list them, and `poly_write` says
+so plainly). Set `PRIVATE_KEY` and restart to unlock trading; there is no
+additional opt-in step and no server-side limit config to tune.
 
-```json
-set_guardrails({ "readOnly": false, "maxOrderSizeUsd": 50, "maxPriceDeviationFromMid": 0.05 })
-```
-
-Fields: `readOnly`, `maxOrderSizeUsd` (limit orders: `price × size`;
-market BUY: `amount`, which is already USD; market SELL: `shares × live
-mid` — refused outright if the notional can't be established while the cap
-is set), `maxPriceDeviationFromMid`,
-`allowedTokenIds`, `maxOpenOrdersTotal`, `allowedTransferAddresses`,
-`maxCollateralActionUsd` (caps `approveErc20`/`splitPosition`/
-`mergePositions`/`depositToPerps`/`withdrawFromPerps` by USD-converted
-amount — these take a raw pUSD base-unit `bigint`, unlike order `size`,
-which is already human-readable share units; see the decimals note in
-`src/guardrails.ts`). Config persists to `guardrails.json` next to the
-server, so it survives restarts. See `src/guardrails.ts`.
+Host-level approval (e.g. Claude Code's own permission prompt on
+`destructiveHint: true` tool calls) is the right place for human-in-the-loop
+confirmation on writes — `poly_write` is annotated accordingly.
 
 ## Live data
 
@@ -152,8 +143,8 @@ server, so it survives restarts. See `src/guardrails.ts`.
   maintained agent guide — this server deliberately has no hand-written
   docs/concepts resource of its own to keep in sync as Polymarket's API
   evolves. `poly_methods` and this server's own error messages (unknown
-  method, `prepare*` rejection, guardrail block, rate limit) are the
-  source of truth for what's callable and how to use it.
+  method, missing credentials, rate limit) are the source of truth for
+  what's callable and how to use it.
 - Full WebSocket topic coverage as MCP resources (`src/live-feeds.ts`), all
   pushed via `notifications/resources/updated` after `resources/subscribe` —
   no polling. One table row per topic (`FEED_DEFS`), not hand-written per

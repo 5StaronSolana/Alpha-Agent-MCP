@@ -39,10 +39,6 @@ const ORDER_METHODS = new Set([
   'placeMarketOrder',
   'createLimitOrder',
   'createMarketOrder',
-  'prepareLimitOrder',
-  'prepareMarketOrder',
-  'prepareLimitOrderPosting',
-  'prepareMarketOrderPosting',
   'postOrder',
   'postOrders',
 ]);

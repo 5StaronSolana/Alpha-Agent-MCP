@@ -11,13 +11,12 @@ import { z } from 'zod';
 import { verifyClientAnchor, BUILDER_CODE } from './config/builder-code.js';
 import { getActiveClient, getPublicClient, hasCredentials } from './config/client.js';
 import { listMethodNames, categoryFor, callMethod, isFundMoving, isOrderMethod, CATEGORIES, describeRateLimit } from './registry.js';
-import { checkGuardrails, getGuardrails, setGuardrails } from './guardrails.js';
 import { getGuide, refreshGuide } from './docs.js';
-import { FEED_DEFS, ensureAndRead, closeAllFeeds } from './live-feeds.js';
+import { FEED_DEFS, ensureAndRead, closeAllFeeds, isLiveFeedUri } from './live-feeds.js';
 
 // ---- Builder attribution integrity gate (see config/builder-code.ts + LICENSE) ----
 
-const EXPECTED_BUILDER_FILE_HASH = '40d09fffbc7f9ca3267f20468dfbdc54e4da773a745a2cf11b49642a84f66d77';
+const EXPECTED_BUILDER_FILE_HASH = 'a6e7789b7334b4facdc131291d1ca8dc159b54d95066158267d276ec65d6acea';
 
 function assertBuilderIntegrity(): void {
   try {
@@ -45,10 +44,8 @@ const server = new McpServer(
     instructions:
       'Call poly_methods first — it reflects exactly what the active client (public or authenticated) can do ' +
       'right now, not a fixed list. poly_read for non-mutating calls, poly_write for mutating ones (orders, ' +
-      'cancels, approvals, transfers, splits/merges/redeems, perps deposit/withdraw) — poly_write is blocked ' +
-      'until set_guardrails({ readOnly: false, ... }) is called. Never call a prepare* method; this is a ' +
-      'one-shot dispatcher and cannot drive its multi-step signing workflow — the error names the one-shot ' +
-      'equivalent to use instead. Paginated results are { items, hasMore, nextCursor }; pass nextCursor back ' +
+      'cancels, approvals, transfers, splits/merges/redeems, perps deposit/withdraw) — poly_write only works once ' +
+      'PRIVATE_KEY is set; without it, fund-moving methods are absent from the client entirely. Paginated results are { items, hasMore, nextCursor }; pass nextCursor back ' +
       "as the next call's params.cursor to page. On-chain writes auto-wait for settlement by default — pass " +
       '{ wait: false } to skip, or { raw: true } to skip response trimming. A rate-limited call returns ' +
       '{ rateLimited, regime, guidance } — back off, do not retry immediately. poly_methods lists names only, ' +
@@ -56,7 +53,9 @@ const server = new McpServer(
       'shape) first: the SDK\'s own validation error lists exactly which fields are missing/invalid before it ' +
       'ever reaches the network. Live-feed resources return { events, status, lastEventAt } — status is ' +
       "'connected' | 'reconnecting' | 'failed'; treat non-'connected' as stale data, not an error to retry " +
-      'yourself (the server reconnects with backoff on its own).',
+      'yourself (the server reconnects with backoff on its own). Hosts without MCP resource support can read the ' +
+      'same feeds via poly_feed_read({ uri }) — same URIs, same { events, status, lastEventAt } shape, no ' +
+      'resources/subscribe required.',
   }
 );
 
@@ -71,17 +70,26 @@ server.registerTool(
     inputSchema: {
       category: z.enum(CATEGORIES).optional().describe('Restrict to one method category.'),
       query: z.string().optional().describe('Substring match on method name (case-insensitive).'),
-      limit: z.number().int().min(1).max(100).default(20).describe('Max methods returned. Raise it or narrow category/query to see more.'),
+      limit: z.number().int().min(1).max(500).default(100).describe('Max methods returned. Raise it or narrow category/query to see more.'),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   async ({ category, query, limit }) => {
     const client = await getActiveClient();
-    let names = listMethodNames(client);
+    const allNames = listMethodNames(client);
+    let names = allNames;
     if (category) names = names.filter((n) => categoryFor(n) === category);
     if (query) names = names.filter((n) => n.toLowerCase().includes(query.toLowerCase()));
     const authenticated = hasCredentials();
     const totalMatched = names.length;
+    // Computed over the full matched set (before slicing to limit), so an agent
+    // that never raises limit/narrows still sees the true shape of what's
+    // available — not just a hint that more exists.
+    const categoryCounts: Record<string, number> = {};
+    for (const n of names) {
+      const cat = categoryFor(n);
+      categoryCounts[cat] = (categoryCounts[cat] ?? 0) + 1;
+    }
     const out = names.slice(0, limit).map((name) => ({
       method: name,
       category: categoryFor(name),
@@ -95,7 +103,11 @@ server.registerTool(
             authenticated,
             count: out.length,
             totalMatched,
-            ...(totalMatched > out.length ? { truncated: `Showing ${out.length} of ${totalMatched}. Narrow category/query or raise limit.` } : {}),
+            totalAvailable: allNames.length,
+            categoryCounts,
+            ...(totalMatched > out.length
+              ? { truncated: `Showing ${out.length} of ${totalMatched}. categoryCounts covers the full matched set; narrow category/query or raise limit to see individual methods.` }
+              : {}),
             ...(!authenticated
               ? { note: 'Order-placement, cancel, approval, transfer, and other fund-moving methods require a signing key — set PRIVATE_KEY to authenticate and reveal them.' }
               : {}),
@@ -164,8 +176,8 @@ server.registerTool(
     title: 'Execute a Polymarket action',
     description:
       'Call a fund-moving Polymarket SDK method by name (place/cancel orders, transfers, approvals, ' +
-      'split/merge/redeem positions, perps deposit/withdraw). Gated by set_guardrails — blocked by default ' +
-      'until readOnly is turned off. Reference: github.com/Polymarket/ts-sdk',
+      'split/merge/redeem positions, perps deposit/withdraw). Requires PRIVATE_KEY — absent that, fund-moving ' +
+      'methods do not exist on the client at all. Reference: github.com/Polymarket/ts-sdk',
     inputSchema: {
       method: z.string().describe('exact fund-moving method name from poly_methods'),
       params: z
@@ -183,9 +195,10 @@ server.registerTool(
       };
     }
     // Without credentials every fund-moving name passes isFundMoving (they're
-    // all "not on the public client"), including typos — and the guardrail
-    // block would fire first, telling the agent it was "blocked" when the
-    // real problem is there's no signing key at all. Say that plainly instead.
+    // all "not on the public client"), including typos, and the SDK call
+    // below would fail with something opaque either way. Say plainly that
+    // there's no signing key at all rather than trying to distinguish typos
+    // from real methods with no way to check.
     if (!hasCredentials()) {
       return {
         isError: true,
@@ -206,28 +219,6 @@ server.registerTool(
           isError: true,
           content: [{ type: 'text', text: `Unknown method "${method}" — call poly_methods to list what's available.` }],
         };
-      }
-      const context: { currentMid?: number; openOrderCount?: number } = {};
-      if (isOrderMethod(method) && params && typeof (params as any).tokenId === 'string') {
-        try {
-          const mid = await client.fetchMidpoint({ tokenId: (params as any).tokenId });
-          context.currentMid = Number((mid as any)?.mid ?? mid);
-        } catch {
-          /* best-effort */
-        }
-      }
-      if (isOrderMethod(method)) {
-        try {
-          const openOrders = client.listOpenOrders({});
-          const page = typeof openOrders.firstPage === 'function' ? await openOrders.firstPage() : await openOrders;
-          context.openOrderCount = Array.isArray(page?.items) ? page.items.length : undefined;
-        } catch {
-          /* best-effort */
-        }
-      }
-      const verdict = checkGuardrails(method, params as Record<string, unknown> | undefined, context);
-      if (!verdict.ok) {
-        return { isError: true, content: [{ type: 'text', text: JSON.stringify({ blocked: true, reason: verdict.reason }) }] };
       }
       const result = await callMethod(client, method, params);
 
@@ -263,36 +254,44 @@ server.registerTool(
 );
 
 server.registerTool(
-  'get_guardrails',
+  'poly_feed_read',
   {
-    title: 'Show safety guardrails',
-    description: 'Show current fund-moving safety guardrails',
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  },
-  async () => ({ content: [{ type: 'text', text: JSON.stringify(getGuardrails()) }] })
-);
-
-server.registerTool(
-  'set_guardrails',
-  {
-    title: 'Configure safety guardrails',
-    description: 'Configure fund-moving safety guardrails (readOnly defaults to true until set here)',
+    title: 'Read a live Polymarket feed',
+    description:
+      'Read the current snapshot of a live-feed URI for hosts without MCP resource support — same feeds as the ' +
+      'polymarket:// MCP resources, no resources/subscribe required: polymarket://market/{tokenId}/book, ' +
+      'polymarket://user/activity (requires PRIVATE_KEY), polymarket://sports/events, ' +
+      'polymarket://comments/{parentEntityType}/{parentEntityId}, polymarket://prices/crypto/binance/{symbol}, ' +
+      'polymarket://prices/crypto/chainlink/{symbol}, polymarket://prices/equity/{symbol}, ' +
+      'polymarket://perps/{instrumentId}/trades|bbo|book|statistics, polymarket://perps/{instrumentId}/candles/{interval}, ' +
+      'polymarket://perps/tickers. Returns { events, status, lastEventAt } — call again for a fresh snapshot, this ' +
+      "does not push updates (hosts with resource support should use resources/subscribe for that instead).",
     inputSchema: {
-      readOnly: z.boolean().optional().describe('false to allow fund-moving calls'),
-      maxOrderSizeUsd: z.number().positive().optional(),
-      maxPriceDeviationFromMid: z.number().positive().optional().describe('e.g. 0.05 = 5%'),
-      allowedTokenIds: z.array(z.string()).optional(),
-      maxOpenOrdersTotal: z.number().nonnegative().optional(),
-      allowedTransferAddresses: z.array(z.string()).optional(),
-      maxCollateralActionUsd: z
-        .number()
-        .positive()
-        .optional()
-        .describe('Caps approveErc20/splitPosition/mergePositions/depositToPerps/withdrawFromPerps by USD-converted amount (pUSD, 6 decimals).'),
+      uri: z.string().describe('exact polymarket:// live-feed URI, e.g. polymarket://market/{tokenId}/book'),
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
   },
-  async (patch) => ({ content: [{ type: 'text', text: JSON.stringify(setGuardrails(patch)) }] })
+  async ({ uri }) => {
+    if (!isLiveFeedUri(uri)) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text:
+              `"${uri}" is not a recognized live-feed URI. Valid patterns: ` +
+              FEED_DEFS.map((def) => def.pattern).join(', '),
+          },
+        ],
+      };
+    }
+    try {
+      const snapshot = await ensureAndRead(uri, () => notifyResourceUpdated(uri));
+      return { content: [{ type: 'text', text: JSON.stringify(snapshot) }] };
+    } catch (err: any) {
+      return { isError: true, content: [{ type: 'text', text: err?.message || String(err) }] };
+    }
+  }
 );
 
 server.registerTool(
@@ -372,9 +371,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    hasCredentials()
-      ? 'alpha-agent-mcp ready (authenticated — guardrails ' + (getGuardrails().readOnly ? 'READ-ONLY' : 'trading enabled') + ')'
-      : 'alpha-agent-mcp ready (read-only — no PRIVATE_KEY set)'
+    hasCredentials() ? 'alpha-agent-mcp ready (authenticated — trading enabled)' : 'alpha-agent-mcp ready (read-only — no PRIVATE_KEY set)'
   );
   if (hasCredentials()) {
     // Prime the position/fill feed at startup rather than waiting for an

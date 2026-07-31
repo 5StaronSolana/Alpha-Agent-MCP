@@ -26,7 +26,7 @@ async function main() {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   console.log(`tools/list OK — ${tools.length} tools: ${names.join(', ')}`);
-  for (const expected of ['poly_read', 'poly_write', 'poly_methods', 'get_guardrails', 'set_guardrails', 'refresh_polymarket_guide']) {
+  for (const expected of ['poly_read', 'poly_write', 'poly_methods', 'poly_feed_read', 'refresh_polymarket_guide']) {
     if (!names.includes(expected)) throw new Error(`Missing expected tool: ${expected}`);
   }
 
@@ -168,11 +168,11 @@ async function main() {
   // Regression test for a real bug: cancelOrder/cancelOrders/cancelAll/
   // cancelMarketOrders were never in the old hardcoded FUND_MOVING_METHODS
   // list, so they were callable via poly_read — completely bypassing the
-  // readOnly guardrail gate for a call that mutates trading state exactly
-  // like placing an order does. Fixed by classifying fund-moving dynamically
+  // read/write split for a call that mutates trading state exactly like
+  // placing an order does. Fixed by classifying fund-moving dynamically
   // (secure-only + not on a small safe-reads denylist) instead of a name
   // list that can silently miss new write methods.
-  console.log('Verifying poly_read rejects cancelOrder (secure-only + mutating — must not bypass guardrails)...');
+  console.log('Verifying poly_read rejects cancelOrder (secure-only + mutating — must not bypass the read/write split)...');
   const cancelViaRead = await client.callTool({ name: 'poly_read', arguments: { method: 'cancelOrder', params: { orderID: 'x' } } });
   if (!cancelViaRead.isError) throw new Error('poly_read should have rejected cancelOrder as fund-moving');
   console.log('poly_read correctly rejected cancelOrder.');
@@ -192,6 +192,20 @@ async function main() {
     throw new Error(`Expected status 'connected' on first read, got '${feedData.status}'`);
   }
   console.log(`live-feed OK — status=${feedData.status}, ${feedData.events.length} buffered event(s).`);
+
+  // poly_feed_read is the tool-only-host equivalent of the resource read above —
+  // same URI, same underlying ensureAndRead(), just reachable without MCP
+  // resource support. Must return the identical { events, status, lastEventAt } shape.
+  console.log(`Calling poly_feed_read({ uri: "polymarket://market/${tokenId}/book" }) — tool-only equivalent of the resource read...`);
+  const feedToolResult = await client.callTool({ name: 'poly_feed_read', arguments: { uri: `polymarket://market/${tokenId}/book` } });
+  if (feedToolResult.isError) {
+    throw new Error(`poly_feed_read errored: ${feedToolResult.content?.[0]?.text}`);
+  }
+  const feedToolData = JSON.parse(feedToolResult.content?.[0]?.text || '{}');
+  if (!('events' in feedToolData) || !('status' in feedToolData) || !('lastEventAt' in feedToolData)) {
+    throw new Error(`Unexpected poly_feed_read shape: ${JSON.stringify(feedToolData).slice(0, 200)}`);
+  }
+  console.log(`poly_feed_read OK — status=${feedToolData.status}, ${feedToolData.events.length} buffered event(s).`);
 
   console.log('Reading polymarket://docs/llms (live fetch from docs.polymarket.com)...');
   const doc = await client.readResource({ uri: 'polymarket://docs/llms' });
