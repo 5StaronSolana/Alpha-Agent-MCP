@@ -7,6 +7,19 @@
   "bin": {
     "alpha-agent-mcp": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/5StaronSolana/Alpha-Agent-MCP.git"
+  },
+  "homepage": "https://github.com/5StaronSolana/Alpha-Agent-MCP#readme",
+  "bugs": {
+    "url": "https://github.com/5StaronSolana/Alpha-Agent-MCP/issues"
+  },
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
     "prepare": "npm run build",

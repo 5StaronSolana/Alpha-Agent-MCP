@@ -7,10 +7,34 @@ per-method hand-written tools: every SDK method is reachable generically.
 
 ## Setup
 
-Canonical one-line install (fetches this repo, builds, and self-registers
-with Claude Code when present — the join5star.xyz URL is a live proxy of
-this repo's `install.sh`, and works independently of the marketing page,
-which remains pre-launch):
+Published on npm — no clone, no build step. Point any stdio-capable host at
+`npx alpha-agent-mcp`:
+
+```json
+{
+  "mcpServers": {
+    "polymarket": {
+      "command": "npx",
+      "args": ["-y", "alpha-agent-mcp"],
+      "env": {
+        "PRIVATE_KEY": "0x...",
+        "WALLET_ADDRESS": "0x..."
+      }
+    }
+  }
+}
+```
+
+For Claude Code specifically:
+
+```bash
+claude mcp add polymarket -s user -- npx -y alpha-agent-mcp
+```
+
+Or the canonical one-line installer (clones this repo, builds, and
+self-registers with Claude Code when present — the join5star.xyz URL is a
+live proxy of this repo's `install.sh`, and works independently of the
+marketing page, which remains pre-launch):
 
 ```bash
 curl -fsSL https://join5star.xyz/mcp/install.sh | bash
@@ -26,7 +50,7 @@ npm install       # builds automatically via the prepare script
 node dist/index.js  # stdio MCP server
 ```
 
-Point your host's `mcpServers` config at it:
+Point your host's `mcpServers` config at the local build instead of `npx`:
 
 ```json
 {
